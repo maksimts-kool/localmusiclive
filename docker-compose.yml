@@ -1,0 +1,49 @@
+name: localmusiclive
+
+services:
+  ffplayout:
+    build:
+      context: ./ffplayout
+      args:
+        FFPLAYOUT_VERSION: ${FFPLAYOUT_VERSION:-2.6.0}
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-Etc/UTC}
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${FFPLAYOUT_PORT:-8787}:8787"
+    volumes:
+      - ${MEDIA_DIR:-./media}:/media
+      - playlists:/playlists
+      - ffplayout-config:/config
+
+  panel:
+    build: ./panel
+    restart: unless-stopped
+    depends_on:
+      ffplayout:
+        condition: service_healthy
+    environment:
+      TZ: ${TZ:-Etc/UTC}
+      FFPLAYOUT_URL: http://ffplayout:8787
+      FFPLAYOUT_USER: ${FFPLAYOUT_USER:-admin}
+      FFPLAYOUT_PASSWORD: ${FFPLAYOUT_PASSWORD:?Set FFPLAYOUT_PASSWORD in .env}
+      FFPLAYOUT_MAIL: ${FFPLAYOUT_MAIL:-admin@localhost.invalid}
+      YOUTUBE_STREAM_KEY: ${YOUTUBE_STREAM_KEY:-}
+      YOUTUBE_RTMP_URL: ${YOUTUBE_RTMP_URL:-rtmp://a.rtmp.youtube.com/live2}
+      STREAM_WIDTH: ${STREAM_WIDTH:-1280}
+      STREAM_HEIGHT: ${STREAM_HEIGHT:-720}
+      STREAM_FPS: ${STREAM_FPS:-30}
+      VIDEO_BITRATE_KBPS: ${VIDEO_BITRATE_KBPS:-3000}
+      AUDIO_BITRATE_KBPS: ${AUDIO_BITRATE_KBPS:-128}
+      X264_PRESET: ${X264_PRESET:-veryfast}
+      LIBRARY_RESCAN_MINUTES: ${LIBRARY_RESCAN_MINUTES:-5}
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${PANEL_PORT:-8080}:8080"
+    volumes:
+      - ${MEDIA_DIR:-./media}:/media:ro
+      - panel-data:/data
+
+volumes:
+  playlists:
+  ffplayout-config:
+  panel-data:

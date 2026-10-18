@@ -1,0 +1,15 @@
+.env
+/media/*
+!/media/.gitkeep
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# Frontend
+node_modules/
+panel/frontend/dist/
+
+.DS_Store
