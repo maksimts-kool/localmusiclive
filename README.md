@@ -58,16 +58,47 @@ ffplay http://localhost:8787/public/1/live/stream.m3u8
   folder to draw from and how many songs before a repeat; on-screen text position,
   font, size, colours and box, with a preview.
 - **History**: what played, whether it was queued or autoplay, and skips.
+- **YouTube** (tab next to Library): search YouTube or paste a link. `+` downloads
+  the video and queues it, the list icon downloads it and plays it next, the arrow
+  only downloads. Progress shows at the top of the tab; downloaded clips join the
+  library like any other file. See [YouTube downloads](#youtube-downloads).
 
 New files in `media/` are picked up every `LIBRARY_RESCAN_MINUTES` (default 5),
 or right away with the rescan button.
+
+## YouTube downloads
+
+The panel uses [yt-dlp](https://github.com/yt-dlp/yt-dlp) (with Deno, which
+yt-dlp needs for YouTube) to fetch videos into `media/youtube/` as
+`Artist - Title [video id].mp4`. It picks H.264 up to your stream height, because
+decoding it is cheap and the Mac is already encoding the stream. Artist and title
+come from the video title ("Daft Punk - Get Lucky (Official Video)" becomes
+*Daft Punk* / *Get Lucky*), or from the channel name when the title has no
+artist. A video already in the library is queued without downloading it again.
+
+- yt-dlp updates itself each time the panel starts (`YTDLP_AUTO_UPDATE`), since
+  YouTube regularly breaks older versions.
+- Videos longer than `YOUTUBE_MAX_MINUTES` (default 20) and live streams are
+  refused.
+- If YouTube asks yt-dlp to "sign in to confirm you're not a bot", export your
+  YouTube cookies in Netscape format (for example with a "cookies.txt" browser
+  extension) and copy them into the panel:
+
+  ```bash
+  docker compose cp cookies.txt panel:/data/youtube-cookies.txt
+  ```
+
+- **Rights:** downloading from YouTube is against YouTube's Terms of Service
+  except where YouTube offers a download option, and restreaming music videos you
+  don't have rights to will trigger Content ID claims, muted streams or strikes on
+  your channel. Use it for videos you own or are licensed to stream.
 
 ## What controls what
 
 | Setting | Where |
 |---|---|
 | Stream key, resolution, frame rate, video/audio bitrate, x264 preset | `.env`, applied to ffplayout each time the panel starts |
-| Admin login, ports, media folder, time zone | `.env` |
+| Admin login, ports, media folder, time zone, YouTube download limits | `.env` |
 | Queue, autoplay, on-screen text | the panel |
 | Everything else in ffplayout (logo, loudness, fillers, …) | ffplayout's UI at :8787 |
 
@@ -86,7 +117,7 @@ comfortable on Apple Silicon; for 1080p30 set `STREAM_WIDTH=1920`,
 
 | Path | What |
 |---|---|
-| `./media` → `/media` | Your clips. ffplayout reads it; the panel reads it read-only. |
+| `./media` → `/media` | Your clips. ffplayout plays from it; the panel indexes it and saves YouTube downloads to `media/youtube/`. |
 | `./media/filler/` | Not in the library. ffplayout plays clips from here to fill gaps. |
 | volume `panel-data` | Panel database (queue, history, settings) and thumbnails |
 | volumes `ffplayout-config`, `playlists` | ffplayout's database, logs and daily playlists |

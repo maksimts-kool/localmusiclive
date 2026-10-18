@@ -37,6 +37,10 @@ class Settings:
     static_dir: Path = Path(os.environ.get("STATIC_DIR", "/app/static"))
     rescan_minutes: int = _int("LIBRARY_RESCAN_MINUTES", 5)
 
+    # YouTube search and download (yt-dlp).
+    youtube_max_minutes: int = _int("YOUTUBE_MAX_MINUTES", 20)
+    ytdlp_auto_update: bool = os.environ.get("YTDLP_AUTO_UPDATE", "true").lower() != "false"
+
     video_extensions: tuple[str, ...] = field(
         default=(".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi", ".ts", ".flv")
     )
@@ -47,6 +51,14 @@ class Settings:
     @property
     def db_path(self) -> Path:
         return self.data_dir / "panel.db"
+
+    @property
+    def download_dir(self) -> Path:
+        return self.media_root / "youtube"
+
+    @property
+    def cookies_file(self) -> Path:
+        return self.data_dir / "youtube-cookies.txt"
 
     @property
     def thumbs_dir(self) -> Path:

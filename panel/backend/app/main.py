@@ -13,6 +13,7 @@ from .engine import OVERLAY_POSITIONS, Engine, EngineError, track_json
 from .ffplayout import FFplayout, FFplayoutError
 from .library import Library
 from .settings import settings
+from .youtube import YouTube
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("panel")
@@ -46,13 +47,17 @@ ff = FFplayout(
 library = Library(db, settings)
 hub = Hub()
 engine = Engine(settings, db, ff, library, hub)
+youtube = YouTube(settings, db, library, engine, hub)
+engine.downloads = youtube
 
 
 @asynccontextmanager
-async def lifespan(_: FastAPI):
+async def lifespan(app: FastAPI):
     if not settings.ffplayout_password:
         log.error("FFPLAYOUT_PASSWORD is not set")
     await engine.start()
+    # Keep a reference so the task isn't garbage-collected.
+    app.state.youtube_setup = asyncio.create_task(youtube.start())
     yield
     await engine.stop()
     await ff.close()
@@ -199,6 +204,34 @@ async def queue_clear() -> dict:
 @app.post("/api/skip")
 async def skip() -> dict:
     await run(engine.skip())
+    return {"ok": True}
+
+
+# --- YouTube -----------------------------------------------------------------
+
+
+@app.get("/api/youtube/search")
+async def youtube_search(q: str = Query(..., min_length=1, max_length=200)) -> list[dict]:
+    try:
+        return await youtube.search(q)
+    except RuntimeError as exc:
+        raise HTTPException(502, f"YouTube search failed: {exc}") from exc
+
+
+class Download(BaseModel):
+    video_id: str = Field(pattern=r"^[A-Za-z0-9_-]{11}$")
+    then: Literal["none", "queue", "next"] = "queue"
+
+
+@app.post("/api/youtube/downloads", status_code=202)
+async def youtube_download(body: Download) -> dict:
+    job = await run(youtube.download(body.video_id, body.then))
+    return job.public()
+
+
+@app.delete("/api/youtube/downloads/{job_id}")
+async def youtube_dismiss(job_id: int) -> dict:
+    await youtube.dismiss(job_id)
     return {"ok": True}
 
 

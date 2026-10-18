@@ -37,10 +37,13 @@ services:
       AUDIO_BITRATE_KBPS: ${AUDIO_BITRATE_KBPS:-128}
       X264_PRESET: ${X264_PRESET:-veryfast}
       LIBRARY_RESCAN_MINUTES: ${LIBRARY_RESCAN_MINUTES:-5}
+      YOUTUBE_MAX_MINUTES: ${YOUTUBE_MAX_MINUTES:-20}
+      YTDLP_AUTO_UPDATE: ${YTDLP_AUTO_UPDATE:-true}
     ports:
       - "${BIND_ADDRESS:-127.0.0.1}:${PANEL_PORT:-8080}:8080"
     volumes:
-      - ${MEDIA_DIR:-./media}:/media:ro
+      # Writable: YouTube downloads are saved to media/youtube/.
+      - ${MEDIA_DIR:-./media}:/media
       - panel-data:/data
 
 volumes:

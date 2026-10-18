@@ -5,6 +5,7 @@
   import Library from './lib/Library.svelte';
   import History from './lib/History.svelte';
   import Settings from './lib/Settings.svelte';
+  import YouTube from './lib/YouTube.svelte';
   import { api } from './lib/api.js';
   import { attempt, toasts } from './lib/toast.svelte.js';
 
@@ -13,6 +14,7 @@
   let connected = $state(false);
   let libraryVersion = $state(0);
   let tab = $state('queue');
+  let source = $state('library');
   let settingsOpen = $state(false);
 
   $effect(() => {
@@ -47,6 +49,8 @@
 
   let status = $derived(data?.status);
   let running = $derived(Boolean(status?.running));
+  let downloads = $derived(data?.downloads ?? []);
+  let downloading = $derived(downloads.filter((d) => ['waiting', 'downloading', 'adding'].includes(d.status)).length);
   let queuedIds = $derived(new Set((data?.queue ?? []).map((q) => q.track?.id)));
 
   let pill = $derived.by(() => {
@@ -129,7 +133,20 @@
   </div>
 
   <section class="card panel right">
-    <Library version={libraryVersion} {queuedIds} scanning={status?.scanning} size={status?.library_size ?? 0} />
+    <div class="tabs" role="tablist">
+      <button role="tab" aria-selected={source === 'library'} class:active={source === 'library'} onclick={() => (source = 'library')}>
+        Library
+      </button>
+      <button role="tab" aria-selected={source === 'youtube'} class:active={source === 'youtube'} onclick={() => (source = 'youtube')}>
+        YouTube
+        {#if downloading}<span class="tab-count">{downloading}</span>{/if}
+      </button>
+    </div>
+    {#if source === 'library'}
+      <Library version={libraryVersion} {queuedIds} scanning={status?.scanning} size={status?.library_size ?? 0} />
+    {:else}
+      <YouTube {downloads} />
+    {/if}
   </section>
 </main>
 
@@ -302,6 +319,19 @@
     font-weight: 600;
     border-bottom: 2px solid transparent;
     margin-bottom: -1px;
+  }
+
+  .tab-count {
+    display: inline-grid;
+    place-items: center;
+    min-width: 18px;
+    height: 18px;
+    margin-left: 4px;
+    padding: 0 5px;
+    border-radius: 99px;
+    background: var(--accent);
+    color: var(--accent-text);
+    font-size: 11px;
   }
 
   .tabs button.active {

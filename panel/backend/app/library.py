@@ -4,9 +4,11 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from typing import Any
 
 from .db import DB
 from .settings import Settings
@@ -76,7 +78,8 @@ def describe(rel_path: str, probe: dict) -> dict | None:
 
     artist = _tag(tags, "artist", "album_artist", "performer")
     title = _tag(tags, "title")
-    stem = PurePosixPath(rel_path).stem
+    # Downloads are named "Artist - Title [video id]".
+    stem = re.sub(r"\s*\[[A-Za-z0-9_-]{11}\]$", "", PurePosixPath(rel_path).stem)
     if not title:
         if " - " in stem:
             guess_artist, title = (part.strip() for part in stem.split(" - ", 1))
@@ -145,6 +148,50 @@ class Library:
             )
         return code == 0 and target.exists()
 
+    async def _index(
+        self, path: str, size: int, mtime: float, row: Any, result: ScanResult
+    ) -> int | None:
+        info = await self.probe(path)
+        if info is None:
+            result.failed += 1
+            return None
+        folder = str(PurePosixPath(path).parent)
+        if row is None:
+            cur = self.db.run(
+                "INSERT INTO tracks (path, folder, artist, title, album, duration, width, height,"
+                " size, mtime, added_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                path, "" if folder == "." else folder, info["artist"], info["title"],
+                info["album"], info["duration"], info["width"], info["height"],
+                size, mtime, time.time(),
+            )
+            track_id = cur.lastrowid
+            result.added += 1
+        else:
+            track_id = row["id"]
+            self.db.run(
+                "UPDATE tracks SET artist = ?, title = ?, album = ?, duration = ?, width = ?,"
+                " height = ?, size = ?, mtime = ?, missing = 0 WHERE id = ?",
+                info["artist"], info["title"], info["album"], info["duration"],
+                info["width"], info["height"], size, mtime, track_id,
+            )
+            result.updated += 1
+        has_thumb = await self.make_thumb(track_id, path, info["duration"])
+        self.db.run("UPDATE tracks SET has_thumb = ? WHERE id = ?", int(has_thumb), track_id)
+        return track_id
+
+    async def add_file(self, rel_path: str, artist: str, title: str) -> int | None:
+        """Index one file now (e.g. a finished download) with the given names."""
+        async with self._scan_lock:
+            st = (self.settings.media_root / rel_path).stat()
+            row = self.db.one("SELECT * FROM tracks WHERE path = ?", rel_path)
+            track_id = await self._index(rel_path, st.st_size, st.st_mtime, row, ScanResult())
+            if track_id is not None:
+                # Kept until the file itself changes; scans only re-read changed files.
+                self.db.run(
+                    "UPDATE tracks SET artist = ?, title = ? WHERE id = ?", artist, title, track_id
+                )
+            return track_id
+
     async def scan(self) -> ScanResult:
         async with self._scan_lock:
             self.scanning = True
@@ -181,36 +228,9 @@ class Library:
             or known[path]["missing"]
         ]
 
-        async def index(path: str, size: int, mtime: float) -> None:
-            info = await self.probe(path)
-            if info is None:
-                result.failed += 1
-                return
-            folder = str(PurePosixPath(path).parent)
-            row = known.get(path)
-            if row is None:
-                cur = self.db.run(
-                    "INSERT INTO tracks (path, folder, artist, title, album, duration, width, height,"
-                    " size, mtime, added_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    path, "" if folder == "." else folder, info["artist"], info["title"],
-                    info["album"], info["duration"], info["width"], info["height"],
-                    size, mtime, time.time(),
-                )
-                track_id = cur.lastrowid
-                result.added += 1
-            else:
-                track_id = row["id"]
-                self.db.run(
-                    "UPDATE tracks SET artist = ?, title = ?, album = ?, duration = ?, width = ?,"
-                    " height = ?, size = ?, mtime = ?, missing = 0 WHERE id = ?",
-                    info["artist"], info["title"], info["album"], info["duration"],
-                    info["width"], info["height"], size, mtime, track_id,
-                )
-                result.updated += 1
-            has_thumb = await self.make_thumb(track_id, path, info["duration"])
-            self.db.run("UPDATE tracks SET has_thumb = ? WHERE id = ?", int(has_thumb), track_id)
-
-        await asyncio.gather(*(index(*item) for item in todo))
+        await asyncio.gather(
+            *(self._index(path, size, mtime, known.get(path), result) for path, size, mtime in todo)
+        )
         if result.changed or result.failed:
             log.info(
                 "Library scan: %d added, %d updated, %d missing, %d unreadable",

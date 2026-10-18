@@ -194,6 +194,7 @@ class Engine:
         self._skip_pending = False
         self._overlay_sent: str | None = None
         self._tasks: list[asyncio.Task] = []
+        self.downloads: Any = None  # YouTube downloader, set by main
 
     # --- lifecycle -------------------------------------------------------------
 
@@ -966,6 +967,7 @@ class Engine:
             "history": history,
             "autoplay": self.autoplay_settings(),
             "overlay": self.overlay_settings(),
+            "downloads": self.downloads.state() if self.downloads else [],
         }
 
     async def broadcast(self) -> None:
