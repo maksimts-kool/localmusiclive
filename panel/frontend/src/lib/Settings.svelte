@@ -4,18 +4,16 @@
   import { api } from './api.js';
   import { attempt } from './toast.svelte.js';
 
-  let { autoplay, overlay, now, next, resolution = [1280, 720], onClose } = $props();
+  let { autoplay, overlay, resolution = [1280, 720], onClose } = $props();
 
   // Edit copies of the settings at the time the dialog opened; saved explicitly.
   let ap = $state(untrack(() => ({ ...autoplay })));
   let ov = $state(untrack(() => ({ ...overlay })));
-  let fonts = $state(untrack(() => [overlay.font_family]));
   let folders = $state([]);
   let dialog;
 
   $effect(() => {
     dialog.showModal();
-    api.get('/api/fonts').then((f) => (fonts = f)).catch(() => {});
     api.get('/api/library/folders').then((f) => (folders = f)).catch(() => {});
   });
 
@@ -28,43 +26,46 @@
     ['bottom-right', 'Bottom right'],
   ];
 
-  function label(track) {
-    return track ? (track.artist ? `${track.artist} – ${track.title}` : track.title) : null;
+  const numeric = [
+    'margin', 'scale', 'start_seconds', 'end_seconds', 'radius',
+    'stroke_width', 'stroke_opacity', 'background_opacity',
+  ];
+
+  function numbers(values) {
+    const out = { ...values };
+    for (const key of numeric) out[key] = Number(out[key]);
+    return out;
   }
 
-  let previewText = $derived(
-    [
-      `Now: ${label(now?.track) ?? 'Artist – Song title'}`,
-      ov.show_next ? `Next: ${label(next?.track) ?? 'Another artist – Next song'}` : null,
-    ]
-      .filter(Boolean)
-      .join('  ·  '),
-  );
+  // Which card the preview shows; on the stream they alternate by themselves.
+  let card = $state('now');
+  let previewUrl = $state(null);
 
-  // The preview is drawn at the stream's resolution and scaled down to fit.
-  let previewStyle = $derived.by(() => {
-    const [v, h] = ov.position.split('-');
-    const m = `${ov.margin}px`;
-    const s = [
-      `font-family: '${ov.font_family}', system-ui, sans-serif`,
-      `font-size: ${ov.font_size}px`,
-      `color: ${ov.text_color}`,
-      `padding: ${ov.background ? ov.padding : 0}px`,
-      `background: ${ov.background ? hexAlpha(ov.background_color, ov.background_opacity) : 'transparent'}`,
-      v === 'top' ? `top: ${m}` : `bottom: ${m}`,
-    ];
-    if (h === 'left') s.push(`left: ${m}`);
-    else if (h === 'right') s.push(`right: ${m}`);
-    else s.push('left: 50%', 'transform: translateX(-50%)');
-    return s.join(';');
+  // The preview is the real card, drawn by the panel with the unsaved settings.
+  $effect(() => {
+    const body = numbers({ ...ov, card: ov.mode === 'always' ? 'now' : card });
+    const controller = new AbortController();
+    const timer = setTimeout(async () => {
+      try {
+        const res = await fetch('/api/overlay/preview', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+          signal: controller.signal,
+        });
+        if (!res.ok) return;
+        const url = URL.createObjectURL(await res.blob());
+        if (previewUrl) URL.revokeObjectURL(previewUrl);
+        previewUrl = url;
+      } catch {
+        // superseded by a newer preview
+      }
+    }, 120);
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
   });
-
-  function hexAlpha(hex, alpha) {
-    const n = parseInt(hex.slice(1), 16);
-    return `rgb(${n >> 16} ${(n >> 8) & 255} ${n & 255} / ${alpha})`;
-  }
-
-  let previewWidth = $state(560);
 
   async function saveAutoplay() {
     const ok = await attempt(
@@ -75,17 +76,7 @@
   }
 
   async function saveOverlay() {
-    const ok = await attempt(
-      () =>
-        api.put('/api/settings/overlay', {
-          ...ov,
-          margin: Number(ov.margin),
-          font_size: Number(ov.font_size),
-          padding: Number(ov.padding),
-          background_opacity: Number(ov.background_opacity),
-        }),
-      'On-screen text updated',
-    );
+    const ok = await attempt(() => api.put('/api/settings/overlay', numbers(ov)), 'Song card updated');
     if (ok) onClose();
   }
 </script>
@@ -125,20 +116,59 @@
   </section>
 
   <section>
-    <h3 class="section-title">On-screen text</h3>
-    <div class="preview" bind:clientWidth={previewWidth} style:aspect-ratio="{resolution[0]} / {resolution[1]}">
-      <div
-        class="canvas"
-        style:width="{resolution[0]}px"
-        style:height="{resolution[1]}px"
-        style:transform="scale({previewWidth / resolution[0]})"
-      >
-        {#if ov.enabled}<div class="text" style={previewStyle}>{previewText}</div>{/if}
+    <h3 class="section-title">Song card on the stream</h3>
+    <p class="muted hint">
+      Shows the song as it starts and the next one before it ends, with a live countdown.
+    </p>
+
+    {#if ov.mode === 'start_end'}
+      <div class="segmented" role="radiogroup" aria-label="Preview">
+        <button role="radio" aria-checked={card === 'now'} class:on={card === 'now'} onclick={() => (card = 'now')}>
+          Song start
+        </button>
+        <button
+          role="radio"
+          aria-checked={card === 'next'}
+          class:on={card === 'next'}
+          disabled={!ov.show_next}
+          onclick={() => (card = 'next')}
+        >
+          Song end
+        </button>
       </div>
+    {/if}
+    <div class="preview" style:aspect-ratio="{resolution[0]} / {resolution[1]}">
+      {#if ov.enabled && previewUrl}<img src={previewUrl} alt="Preview of the song card" />{/if}
+    </div>
+
+    <div class="group">
+      <label class="check"><input type="checkbox" bind:checked={ov.enabled} /> Show the song card</label>
+      <label class="check">
+        <input type="checkbox" bind:checked={ov.show_next} disabled={!ov.enabled} /> Announce the next song
+      </label>
     </div>
     <div class="grid">
-      <label class="check"><input type="checkbox" bind:checked={ov.enabled} /> Show “Now / Next” text</label>
-      <label class="check"><input type="checkbox" bind:checked={ov.show_next} disabled={!ov.enabled} /> Include the next song</label>
+      <label>
+        <span>When</span>
+        <select bind:value={ov.mode} disabled={!ov.enabled}>
+          <option value="start_end">Start and end of each song</option>
+          <option value="always">All the time</option>
+        </select>
+      </label>
+      <label>
+        <span>“Now playing” for the first (s)</span>
+        <input type="number" min="0" max="600" bind:value={ov.start_seconds} disabled={!ov.enabled || ov.mode !== 'start_end'} />
+      </label>
+      <label>
+        <span>“Up next” for the last (s)</span>
+        <input
+          type="number"
+          min="0"
+          max="600"
+          bind:value={ov.end_seconds}
+          disabled={!ov.enabled || ov.mode !== 'start_end' || !ov.show_next}
+        />
+      </label>
       <label>
         <span>Position</span>
         <select bind:value={ov.position}>
@@ -150,32 +180,45 @@
         <input type="number" min="0" max="400" bind:value={ov.margin} />
       </label>
       <label>
-        <span>Font</span>
-        <select bind:value={ov.font_family}>
-          {#each fonts as f}<option value={f}>{f}</option>{/each}
-        </select>
+        <span>Size ({ov.scale} %)</span>
+        <input type="range" min="50" max="250" step="5" bind:value={ov.scale} />
       </label>
-      <label>
-        <span>Size (px)</span>
-        <input type="number" min="10" max="120" bind:value={ov.font_size} />
+    </div>
+
+    <h4 class="sub-title">Look</h4>
+    <div class="grid">
+      <label class="color">
+        <span>Accent</span>
+        <input type="color" bind:value={ov.accent_color} />
       </label>
       <label class="color">
-        <span>Text colour</span>
-        <input type="color" bind:value={ov.text_color} />
+        <span>Background</span>
+        <input type="color" bind:value={ov.background_color} />
       </label>
-      <label class="check"><input type="checkbox" bind:checked={ov.background} /> Background box</label>
+      <label>
+        <span>Background opacity</span>
+        <input type="range" min="0" max="1" step="0.02" bind:value={ov.background_opacity} />
+      </label>
+      <label>
+        <span>Corner radius ({ov.radius} px)</span>
+        <input type="range" min="0" max="40" step="1" bind:value={ov.radius} />
+      </label>
+      <label class="check"><input type="checkbox" bind:checked={ov.stroke} /> Border</label>
       <label class="color">
-        <span>Box colour</span>
-        <input type="color" bind:value={ov.background_color} disabled={!ov.background} />
+        <span>Border colour</span>
+        <input type="color" bind:value={ov.stroke_color} disabled={!ov.stroke} />
       </label>
       <label>
-        <span>Box opacity</span>
-        <input type="range" min="0" max="1" step="0.05" bind:value={ov.background_opacity} disabled={!ov.background} />
+        <span>Border opacity</span>
+        <input type="range" min="0" max="1" step="0.02" bind:value={ov.stroke_opacity} disabled={!ov.stroke} />
       </label>
       <label>
-        <span>Box padding (px)</span>
-        <input type="number" min="0" max="80" bind:value={ov.padding} disabled={!ov.background} />
+        <span>Border width ({ov.stroke_width} px)</span>
+        <input type="range" min="0.5" max="6" step="0.5" bind:value={ov.stroke_width} disabled={!ov.stroke} />
       </label>
+      <label class="check"><input type="checkbox" bind:checked={ov.shadow} /> Shadow</label>
+      <label class="check"><input type="checkbox" bind:checked={ov.show_thumbnail} /> Thumbnail</label>
+      <label class="check"><input type="checkbox" bind:checked={ov.show_progress} /> Progress bar</label>
     </div>
     <div class="row-end"><button class="btn primary" onclick={saveOverlay}>Apply on stream</button></div>
   </section>
@@ -225,10 +268,23 @@
     font-size: 13px;
   }
 
+  .sub-title {
+    margin: 18px 0 0;
+    font-size: 13px;
+    color: var(--muted);
+  }
+
   .grid {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
     gap: 12px 16px;
+    margin-top: 10px;
+  }
+
+  .group {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 20px;
     margin-top: 10px;
   }
 
@@ -273,24 +329,45 @@
   .preview {
     position: relative;
     width: 100%;
-    max-width: 520px;
+    max-width: 560px;
     margin-top: 10px;
     border-radius: 8px;
     overflow: hidden;
-    background:
-      linear-gradient(135deg, #2b3a67 0%, #6b3f74 50%, #c06c4c 100%);
+    background: linear-gradient(135deg, #2b3a67 0%, #6b3f74 50%, #c06c4c 100%);
   }
 
-  .canvas {
+  .preview img {
     position: absolute;
-    top: 0;
-    left: 0;
-    transform-origin: 0 0;
+    inset: 0;
+    width: 100%;
+    height: 100%;
   }
 
-  .text {
-    position: absolute;
-    white-space: nowrap;
-    line-height: 1.2;
+  .segmented {
+    display: inline-flex;
+    margin-top: 4px;
+    padding: 3px;
+    border-radius: 9px;
+    background: var(--surface-3);
+  }
+
+  .segmented button {
+    border: 0;
+    border-radius: 7px;
+    padding: 4px 12px;
+    background: transparent;
+    color: var(--muted);
+    font-size: 13px;
+    font-weight: 600;
+  }
+
+  .segmented button.on {
+    background: var(--surface);
+    color: var(--text);
+    box-shadow: 0 1px 3px rgb(0 0 0 / 0.2);
+  }
+
+  .segmented button:disabled {
+    opacity: 0.4;
   }
 </style>

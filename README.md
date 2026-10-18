@@ -33,7 +33,8 @@ autoplay when the queue runs dry, and a "Now · Next" lower third on the stream.
    docker compose up -d --build
    ```
 
-   The first build downloads ffplayout and builds the panel; it takes a few minutes.
+   The first build compiles ffplayout from source (with a small patch, see
+   [Song card](#song-card)) and builds the panel; it takes several minutes.
 
 4. Open the panel at <http://localhost:8080> and press **Start**.
 
@@ -55,8 +56,8 @@ ffplay http://localhost:8787/public/1/live/stream.m3u8
   song will start. Below the queue is the autoplay preview.
 - **Skip** cuts to the next song immediately.
 - **Settings** (gear): autoplay order (shuffle, least played, library order), a
-  folder to draw from and how many songs before a repeat; on-screen text position,
-  font, size, colours and box, with a preview.
+  folder to draw from and how many songs before a repeat; the song card's timing,
+  position, size and look, with a live preview.
 - **History**: what played, whether it was queued or autoplay, and skips.
 - **YouTube** (tab next to Library): search YouTube or paste a link. `+` downloads
   the video and queues it, the list icon downloads it and plays it next, the arrow
@@ -70,8 +71,10 @@ or right away with the rescan button.
 
 The panel uses [yt-dlp](https://github.com/yt-dlp/yt-dlp) (with Deno, which
 yt-dlp needs for YouTube) to fetch videos into `media/youtube/` as
-`Artist - Title [video id].mp4`. It picks H.264 up to your stream height, because
-decoding it is cheap and the Mac is already encoding the stream. Artist and title
+`Artist - Title [video id].mkv`. It takes the best video and best audio YouTube
+offers (typically VP9 or AV1 with Opus, hence MKV); set `YOUTUBE_MAX_HEIGHT`
+(for example `1080`) to cap the resolution, since 4K files are large and decoding
+them costs CPU while the Mac is also encoding the stream. Artist and title
 come from the video title ("Daft Punk - Get Lucky (Official Video)" becomes
 *Daft Punk* / *Get Lucky*), or from the channel name when the title has no
 artist. A video already in the library is queued without downloading it again.
@@ -93,19 +96,39 @@ artist. A video already in the library is queued without downloading it again.
   don't have rights to will trigger Content ID claims, muted streams or strikes on
   your channel. Use it for videos you own or are licensed to stream.
 
+## Song card
+
+The stream shows a card at the start of each song ("Now playing", with the title,
+artist, thumbnail, time to the next song and a progress bar) and again just
+before it ends ("Up next", with a countdown). By default it shows for the first
+15 and the last 20 seconds, fading in and out; it can also stay on all the time.
+Position, size, accent and background colours, border, corner radius, shadow,
+thumbnail and progress bar are set in the panel's settings.
+
+The panel draws the card as a transparent PNG (`media/.overlay/card.png`) up to
+ten times a second while it fades, and once a second otherwise for the countdown.
+ffplayout shows it through its logo slot. Stock ffplayout reads the logo only
+once per clip, so the ffplayout image is built from source with
+`ffplayout/live-logo.patch`, which reloads the logo whenever the file changes.
+When upgrading `FFPLAYOUT_VERSION`, check that the patch still applies.
+
+The card uses Inter, which covers Latin, Cyrillic and Greek; titles in other
+scripts (e.g. Japanese) show as boxes.
+
 ## What controls what
 
 | Setting | Where |
 |---|---|
 | Stream key, resolution, frame rate, video/audio bitrate, x264 preset | `.env`, applied to ffplayout each time the panel starts |
 | Admin login, ports, media folder, time zone, YouTube download limits | `.env` |
-| Queue, autoplay, on-screen text | the panel |
-| Everything else in ffplayout (logo, loudness, fillers, …) | ffplayout's UI at :8787 |
+| Queue, autoplay, song card | the panel |
+| ffplayout's logo slot | the panel (it shows the song card), so don't set a logo in ffplayout |
+| Everything else in ffplayout (loudness, fillers, …) | ffplayout's UI at :8787 |
 
 Change `.env`, then `docker compose up -d` to apply. Two things are set only on
 the very first run: the ffplayout password (change it in ffplayout's UI *and*
-`.env` afterwards) and two defaults the panel applies once, which are logo off and
-loudness target −14 LUFS (YouTube's level; ffplayout defaults to −23).
+`.env` afterwards) and the loudness target, which the panel sets once to −14 LUFS
+(YouTube's level; ffplayout defaults to −23).
 
 Output is H.264 (x264, `veryfast`, constant bitrate) + AAC with a 2-second
 keyframe interval, which ffplayout always uses for stream output. Docker on a Mac
@@ -158,12 +181,9 @@ The core of this is `panel/backend/app/timeline.py` (with tests) and
   of a second when ffplayout reloads the playlist.
 - If ffplayout or the panel restarts, playout resumes where the schedule says it
   should be. Queued songs that never got to play stay in the queue.
-- The ffplayout image installs the official release `.deb` (`FFPLAYOUT_VERSION` in
-  `.env`). ffplayout 2.x's own `docker/` folder only has build environments, no
-  runtime image.
-- ffplayout 2.x draws the text overlay with its own renderer, not FFmpeg's
-  `drawtext`; fonts listed in the settings are the ones installed in the
-  ffplayout image (DejaVu and Noto).
+- The ffplayout image is built from the release's source tag
+  (`FFPLAYOUT_VERSION` in `.env`) plus `live-logo.patch`. ffplayout 2.x's own
+  `docker/` folder only has build environments, no runtime image.
 
 ## Development
 
@@ -173,6 +193,16 @@ cd panel/backend && python3 -m pytest tests
 # frontend with hot reload, against a panel on localhost:8080
 cd panel/frontend && npm install && npm run dev
 ```
+
+To try changes without touching the live channel, run a second stack under
+another project name, with other ports, no stream key and a test media folder
+(shell variables override `.env`):
+
+```bash
+MEDIA_DIR=/path/to/test-clips YOUTUBE_STREAM_KEY= PANEL_PORT=18080 FFPLAYOUT_PORT=18787 docker compose -p lmltest up -d --build
+```
+
+Remove it afterwards with `docker compose -p lmltest down -v`.
 
 The queue table already records who requested a song (`requested_by`), ready for
 viewer requests from YouTube live chat later.

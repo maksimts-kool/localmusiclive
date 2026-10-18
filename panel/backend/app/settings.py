@@ -39,6 +39,8 @@ class Settings:
 
     # YouTube search and download (yt-dlp).
     youtube_max_minutes: int = _int("YOUTUBE_MAX_MINUTES", 20)
+    # 0 = best available resolution.
+    youtube_max_height: int = _int("YOUTUBE_MAX_HEIGHT", 0)
     ytdlp_auto_update: bool = os.environ.get("YTDLP_AUTO_UPDATE", "true").lower() != "false"
 
     video_extensions: tuple[str, ...] = field(

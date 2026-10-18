@@ -1,0 +1,126 @@
+diff --git a/backend/engine/src/playout.rs b/backend/engine/src/playout.rs
+index bb82ebd..51e0e15 100644
+--- a/backend/engine/src/playout.rs
++++ b/backend/engine/src/playout.rs
+@@ -1,4 +1,8 @@
+-use std::{error::Error, fmt, time::Instant};
++use std::{
++    error::Error,
++    fmt,
++    time::{Duration, Instant, SystemTime},
++};
+ 
+ use anyhow::{Context, Result, anyhow};
+ use ffmpeg_next::{
+@@ -16,13 +20,61 @@ use crate::{
+     input::timestamps::LiveTimestampTracker,
+     output::FrameOutput,
+     utils::{
+-        config::{OutputConfig, TextOverlayState},
++        config::{LogoConfig, OutputConfig, TextOverlayState},
+         ffmpeg::{make_video_frame_writable, reference_video_frame},
+         helper::{even, is_live_input, open_media_input},
+     },
+ };
+ 
+ const LOGO_FADE_SECONDS: f64 = 1.0;
++const LIVE_LOGO_CHECK: Duration = Duration::from_millis(100);
++
++/// Reloads the logo when its file changes, so another program can update the
++/// picture while a clip plays (localmusiclive patch: on-screen song cards).
++/// Writers should replace the file atomically (write elsewhere, then rename).
++struct LiveLogo {
++    config: LogoConfig,
++    width: u32,
++    height: u32,
++    modified: Option<SystemTime>,
++    next_check: Instant,
++}
++
++impl LiveLogo {
++    fn new(config: &LogoConfig, width: u32, height: u32, loaded: bool) -> Self {
++        Self {
++            config: config.clone(),
++            width,
++            height,
++            modified: loaded.then(|| Self::modified(&config.path)).flatten(),
++            next_check: Instant::now() + LIVE_LOGO_CHECK,
++        }
++    }
++
++    fn modified(path: &str) -> Option<SystemTime> {
++        std::fs::metadata(path).and_then(|meta| meta.modified()).ok()
++    }
++
++    fn refresh(&mut self, logo: &mut Option<LogoOverlay>) {
++        let now = Instant::now();
++        if now < self.next_check {
++            return;
++        }
++        self.next_check = now + LIVE_LOGO_CHECK;
++
++        let modified = Self::modified(&self.config.path);
++        if modified.is_none() || modified == self.modified {
++            return;
++        }
++        match LogoOverlay::load(&self.config, self.width, self.height) {
++            Ok(overlay) => {
++                *logo = Some(overlay);
++                self.modified = modified;
++            }
++            Err(error) => trace!("live logo reload failed: {error:#}"),
++        }
++    }
++}
+ const MEDIA_FADE_SECONDS: f64 = 1.0;
+ const MEDIA_DURATION_TOLERANCE_US: i64 = 500_000;
+ const MIN_LOOP_REMAINING_SECONDS: f64 = 3.0;
+@@ -1230,6 +1282,9 @@ fn encode_composited_frame<O: FrameOutput>(
+     video
+         .runtime_text
+         .update(timeline.video_pts, timeline.text_pts);
++    if let Some(live_logo) = video.live_logo.as_mut() {
++        live_logo.refresh(&mut video.logo);
++    }
+     let video_opacity = media_fade_plan.video_opacity_at(timeline.video_pts);
+     let changes_pixels = video_frame_needs_write(
+         video_opacity,
+@@ -1649,6 +1704,7 @@ struct VideoDecoder {
+     x_offset: u32,
+     y_offset: u32,
+     logo: Option<LogoOverlay>,
++    live_logo: Option<LiveLogo>,
+     text: Option<TextOverlay>,
+     runtime_text: RuntimeTextOverlay,
+     frame_rate_converter: FrameRateConverter,
+@@ -1700,6 +1756,16 @@ impl VideoDecoder {
+         )?;
+         let runtime_text =
+             RuntimeTextOverlay::new(label, cfg, start_pts, scroll_pts, "runtime text overlay")?;
++        // A missing or half-written logo must not stop playout; LiveLogo retries.
++        let logo = cfg.logo.as_ref().and_then(|config| {
++            LogoOverlay::load(config, cfg.width, cfg.height)
++                .map_err(|error| debug!("logo not loaded: {error:#}"))
++                .ok()
++        });
++        let live_logo = cfg
++            .logo
++            .as_ref()
++            .map(|config| LiveLogo::new(config, cfg.width, cfg.height, logo.is_some()));
+         Ok(Self {
+             decoder,
+             scaler,
+@@ -1709,11 +1775,8 @@ impl VideoDecoder {
+             scaled_height: scale.scaled_height,
+             x_offset: scale.x_offset,
+             y_offset: scale.y_offset,
+-            logo: cfg
+-                .logo
+-                .as_ref()
+-                .map(|logo| LogoOverlay::load(logo, cfg.width, cfg.height))
+-                .transpose()?,
++            logo,
++            live_logo,
+             text: cfg
+                 .text
+                 .as_ref()

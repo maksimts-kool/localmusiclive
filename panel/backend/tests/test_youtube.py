@@ -1,4 +1,4 @@
-from app.youtube import safe_filename, split_title, video_id_from
+from app.youtube import download_formats, safe_filename, split_title, video_id_from
 
 
 def test_artist_and_title_from_video_title():
@@ -39,3 +39,8 @@ def test_video_id_from_urls():
 
 def test_safe_filename():
     assert safe_filename('AC/DC - Back In Black: "Live"?') == "ACDC - Back In Black Live"
+
+
+def test_download_formats():
+    assert download_formats() == "bv*+ba/b"
+    assert download_formats(1080) == "bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/b"

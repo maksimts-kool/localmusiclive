@@ -154,8 +154,6 @@
   <Settings
     autoplay={data.autoplay}
     overlay={data.overlay}
-    now={data.now}
-    next={data.next}
     resolution={status?.resolution}
     onClose={() => (settingsOpen = false)}
   />

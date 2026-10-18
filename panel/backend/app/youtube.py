@@ -68,6 +68,14 @@ def safe_filename(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip(" .")[:120] or "video"
 
 
+def download_formats(max_height: int = 0) -> str:
+    """Best video plus best audio, optionally no taller than max_height."""
+    if max_height > 0:
+        cap = f"[height<={max_height}]"
+        return f"bv*{cap}+ba/b{cap}/bv*+ba/b"
+    return "bv*+ba/b"
+
+
 def thumbnail(video_id: str) -> str:
     return f"https://i.ytimg.com/vi/{video_id}/mqdefault.jpg"
 
@@ -228,12 +236,7 @@ class YouTube:
 
     async def _download(self, job: Job) -> None:
         url = f"https://www.youtube.com/watch?v={job.video_id}"
-        height = self.s.stream_height
-        # Prefer H.264: decoding it is cheap, and the Mac also has to encode the stream.
-        formats = (
-            f"bv*[height<={height}][vcodec^=avc1]+ba[ext=m4a]/bv*[height<={height}]+ba"
-            f"/b[height<={height}]/bv*+ba/b"
-        )
+        formats = download_formats(self.s.youtube_max_height)
         tmp = self.s.data_dir / "tmp"
         tmp.mkdir(parents=True, exist_ok=True)
         info_file = tmp / f"{job.video_id}.info.json"

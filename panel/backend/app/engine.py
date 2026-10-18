@@ -12,6 +12,7 @@ would shift its clock instead, which breaks the hand-over at midnight.
 """
 
 import asyncio
+import io
 import json
 import logging
 import os
@@ -26,6 +27,7 @@ from zoneinfo import ZoneInfo
 from .db import DB
 from .ffplayout import FFplayout, FFplayoutError
 from .library import Library
+from . import overlay
 from .settings import Settings
 from .timeline import DAY, MIN_PART, Slot, gap, layout
 
@@ -59,26 +61,35 @@ AUTOPLAY_DEFAULTS = {
 
 OVERLAY_DEFAULTS = {
     "enabled": True,
+    # "start_end": "Now playing" as a song starts, "Up next" before it ends.
+    # "always": the "Now playing" card the whole time.
+    "mode": "start_end",
+    "start_seconds": 15,
+    "end_seconds": 20,
     "show_next": True,
     "position": "bottom-left",
-    "margin": 40,
-    "font_family": "DejaVu Sans",
-    "font_size": 26,
-    "text_color": "#ffffff",
-    "background": True,
-    "background_color": "#000000",
-    "background_opacity": 0.55,
-    "padding": 12,
+    "margin": 48,
+    "scale": 100,
+    "accent_color": "#ff5c7a",
+    "background_color": "#0e1118",
+    "background_opacity": 0.9,
+    "stroke": True,
+    "stroke_color": "#ffffff",
+    "stroke_opacity": 0.16,
+    "stroke_width": 1.5,
+    "radius": 18,
+    "shadow": True,
+    "show_thumbnail": True,
+    "show_progress": True,
 }
-
-OVERLAY_POSITIONS = {
-    "bottom-left": ("{m}", "end:{m}"),
-    "bottom-center": ("center", "end:{m}"),
-    "bottom-right": ("end:{m}", "end:{m}"),
-    "top-left": ("{m}", "{m}"),
-    "top-center": ("center", "{m}"),
-    "top-right": ("end:{m}", "{m}"),
-}
+OVERLAY_POSITIONS = (
+    "bottom-left", "bottom-center", "bottom-right", "top-left", "top-center", "top-right",
+)
+# Card fades in/out over this long; "Up next" is gone this long before the cut.
+CARD_FADE = 0.5
+CARD_END_GAP = 0.2
+# Where the panel puts the card for ffplayout, relative to the media folder.
+CARD_FILE = ".overlay/card.png"
 
 
 class EngineError(Exception):
@@ -125,6 +136,33 @@ def label(track: Any) -> str:
         return ""
     artist, title = track["artist"], track["title"]
     return f"{artist} – {title}" if artist else title
+
+
+def card_phase(position: float, until_next: float | None, settings: dict) -> tuple[str, float] | None:
+    """Which card the stream shows ("now" or "next") and how opaque it is.
+
+    `position` is how far into the song we are, `until_next` how long until the
+    next song starts (None if nothing follows).
+    """
+    if not settings["enabled"]:
+        return None
+    has_next = settings["show_next"] and until_next is not None
+    if settings["mode"] == "always":
+        return "now", min(1.0, max(position, 0.0) / CARD_FADE)
+    if has_next and CARD_END_GAP < until_next <= settings["end_seconds"]:
+        shown = settings["end_seconds"] - until_next
+        return "next", min(1.0, shown / CARD_FADE, (until_next - CARD_END_GAP) / CARD_FADE)
+    if 0 <= position < settings["start_seconds"]:
+        opacity = min(1.0, position / CARD_FADE, (settings["start_seconds"] - position) / CARD_FADE)
+        if until_next is not None:
+            opacity = min(opacity, max(until_next - CARD_END_GAP, 0.0) / CARD_FADE)
+        return ("now", opacity) if opacity > 0 else None
+    return None
+
+
+def clock(seconds: float) -> str:
+    seconds = max(0, int(seconds + 0.999))
+    return f"{seconds // 60}:{seconds % 60:02d}"
 
 
 def shorten(text: str, limit: int = 56) -> str:
@@ -192,7 +230,8 @@ class Engine:
         self._fresh_failures = 0
         self._interrupted: tuple[str, int, int, float] | None = None
         self._skip_pending = False
-        self._overlay_sent: str | None = None
+        self._card_key: tuple | None = None
+        self._text_cleared = False
         self._tasks: list[asyncio.Task] = []
         self.downloads: Any = None  # YouTube downloader, set by main
 
@@ -204,6 +243,7 @@ class Engine:
             asyncio.create_task(self._process_events(), name="process"),
             asyncio.create_task(self._housekeeping(), name="housekeeping"),
             asyncio.create_task(self._rescan_loop(), name="rescan"),
+            asyncio.create_task(self._overlay_loop(), name="overlay"),
         ]
 
     async def stop(self) -> None:
@@ -297,9 +337,16 @@ class Engine:
             options.pop("quality", None)
             out["video_options"] = options
 
+        # The song card is drawn by the panel and shown through ffplayout's logo
+        # slot (see live-logo.patch). ffplayout only accepts a logo file that exists.
+        overlay.write(overlay.BLANK, self.s.media_root / CARD_FILE)
+        self._card_key = None
+        cfg["processing"].update(
+            add_logo=True, logo=CARD_FILE, logo_position="0:0", logo_opacity=1.0, logo_scale=""
+        )
+
         if not self.db.get_setting("ffplayout_defaults_applied"):
-            # One-time defaults; change them in ffplayout's UI afterwards.
-            cfg["processing"]["add_logo"] = False
+            # One-time default; change it in ffplayout's UI afterwards.
             # YouTube plays music at about -14 LUFS; ffplayout defaults to -23.
             cfg["audio"]["loudness_target_lufs"] = -14.0
 
@@ -398,7 +445,7 @@ class Engine:
         if not self.status.running or self.status.ffplayout != "ok":
             self.status.running = True
             self.status.ffplayout = "ok"
-            self._overlay_sent = None
+            self._text_cleared = False
             log.info("Playout is running")
 
         index = event.get("index")
@@ -420,8 +467,6 @@ class Engine:
         cur = self.current
         if key == self._last_key and cur is not None:
             cur.elapsed, cur.received_at, cur.shift = elapsed, received, shift
-            if self._overlay_sent is None:
-                await self._update_overlay()
             return
 
         self._last_key = key
@@ -486,7 +531,6 @@ class Engine:
             log.info("On air: %s", "ffplayout placeholder" if not source else source)
             if self._has_material():
                 await self._fresh_start("placeholder or unknown clip on air")
-        await self._update_overlay()
 
     def _start_history(self, slot: Slot, started_at: float) -> int:
         with self.db.tx():
@@ -696,54 +740,112 @@ class Engine:
 
     # --- overlay ---------------------------------------------------------------
 
-    def _overlay_text(self, settings: dict) -> str:
-        cur = self.current
-        parts = []
-        if cur is not None and cur.managed:
-            parts.append(f"Now: {shorten(cur.slot.title)}")
-        if settings["show_next"] and (nxt := self._next_slot()):
-            parts.append(f"Next: {shorten(nxt.title)}")
-        return "  ·  ".join(parts)
+    def _track(self, track_id: int | None) -> Any:
+        if track_id is None:
+            return None
+        return self.db.one("SELECT * FROM tracks WHERE id = ?", track_id)
 
-    async def _update_overlay(self, force: bool = False) -> None:
+    def _card_for(self, phase: str, opacity: float, position: float, until_next: float | None,
+                  length: float, now_slot: Slot | None, next_slot: Slot | None) -> overlay.Card | None:
+        slot = next_slot if phase == "next" else now_slot
+        if slot is None:
+            return None
+        track = self._track(slot.track_id)
+        title = track["title"] if track else slot.title
+        artist = track["artist"] if track else ""
+        thumb = self.library.thumb_path(track["id"]) if track and track["has_thumb"] else None
+        if phase == "next":
+            status, time_left = "Starts in {time}", until_next or 0
+        elif until_next is not None:
+            status, time_left = "Next song in {time}", until_next
+        else:
+            status, time_left = "{time} left", length - position
+        return overlay.Card(
+            heading="Up next" if phase == "next" else "Now playing",
+            title=title,
+            artist=artist,
+            status=status,
+            time=clock(time_left),
+            progress=position / length if length > 0 else None,
+            thumb=thumb,
+            opacity=round(opacity, 2),
+        )
+
+    def _current_card(self, settings: dict) -> overlay.Card | None:
+        cur = self.current
+        if not self.status.running or cur is None or not cur.managed:
+            return None
+        position = cur.slot.seek + self._elapsed(cur)
+        # The next song starts where this one ends, which for a clip split at
+        # midnight is the end of tomorrow's part.
+        length = cur.slot.full_out or cur.slot.out
+        nxt = self._next_slot()
+        until_next = length - position if nxt else None
+        phase = card_phase(position, until_next, settings)
+        if phase is None:
+            return None
+        return self._card_for(phase[0], phase[1], position, until_next, length, cur.slot, nxt)
+
+    def preview_card(self, settings: dict, phase: str) -> bytes:
+        """The card as it would look now, for the settings dialog."""
+        cur = self.current
+        now_slot = cur.slot if cur is not None and cur.managed else None
+        nxt = self._next_slot()
+        sample = Slot(kind="auto", path="", seek=0, out=212, duration=212, title="Artist – Song title")
+        card = self._card_for(
+            phase, 1.0, 64.0, 148.0, 212.0, now_slot or sample, nxt or now_slot or sample
+        )
+        image = overlay.render(card, {**OVERLAY_DEFAULTS, **settings}, (self.s.stream_width, self.s.stream_height))
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG", compress_level=1)
+        return buffer.getvalue()
+
+    async def _update_overlay(self) -> None:
         if not self.status.running:
             return
-        ov = self.overlay_settings()
-        margin = int(ov["margin"])
-        x, y = OVERLAY_POSITIONS.get(ov["position"], OVERLAY_POSITIONS["bottom-left"])
-        preset = {
-            "channel_id": self.s.channel_id,
-            "name": "localmusiclive",
-            "text": self._overlay_text(ov) if ov["enabled"] else "",
-            "use_filename": False,
-            "font_family": ov["font_family"],
-            "font_weight": "normal",
-            "filename_regex": r"^.+[/\\](.*)(.mp4|.mkv|.webm)$",
-            "position_x": x.format(m=margin),
-            "position_y": y.format(m=margin),
-            "font_size": float(ov["font_size"]),
-            "line_spacing": 4.0,
-            "text_color": ov["text_color"],
-            "text_opacity": 1.0,
-            "background_enabled": bool(ov["background"]),
-            "background_color": ov["background_color"],
-            "background_opacity": float(ov["background_opacity"]),
-            "background_padding": int(ov["padding"]),
-            "opacity": 1.0,
-            "scroll_direction": "none",
-            "scroll_speed": 100,
-            "scroll_repeat": -1,
-            "fade_in_seconds": 0.0,
-            "fade_out_seconds": 0.0,
-        }
-        signature = json.dumps(preset, sort_keys=True)
-        if signature == self._overlay_sent and not force:
+        if not self._text_cleared:
+            # The card replaced ffplayout's plain text overlay; clear any left over.
+            try:
+                await self.ff.send_text({
+                    "channel_id": self.s.channel_id, "name": "localmusiclive", "text": "",
+                    "use_filename": False, "font_family": "Inter", "font_weight": "normal",
+                    "filename_regex": "", "position_x": "0", "position_y": "0",
+                    "font_size": 24.0, "line_spacing": 4.0, "text_color": "#ffffff",
+                    "text_opacity": 1.0, "background_enabled": False,
+                    "background_color": "#000000", "background_opacity": 0.0,
+                    "background_padding": 0, "opacity": 1.0, "scroll_direction": "none",
+                    "scroll_speed": 100, "scroll_repeat": -1,
+                    "fade_in_seconds": 0.0, "fade_out_seconds": 0.0,
+                })
+                self._text_cleared = True
+            except FFplayoutError as exc:
+                log.debug("Could not clear the text overlay: %s", exc)
+
+        settings = self.overlay_settings()
+        card = self._current_card(settings)
+        key = None if card is None else (
+            card.heading, card.title, card.artist, card.status, card.time, card.opacity,
+            round(card.progress or 0, 3), str(card.thumb), json.dumps(settings, sort_keys=True),
+        )
+        if key == self._card_key:
             return
-        try:
-            await self.ff.send_text(preset)
-            self._overlay_sent = signature
-        except FFplayoutError as exc:
-            log.warning("Could not update the on-screen text: %s", exc)
+        self._card_key = key
+        size = (self.s.stream_width, self.s.stream_height)
+        target = self.s.media_root / CARD_FILE
+        image = overlay.BLANK if card is None else await asyncio.to_thread(overlay.render, card, settings, size)
+        await asyncio.to_thread(overlay.write, image, target)
+
+    async def _overlay_loop(self) -> None:
+        # Fades need ~10 updates a second; otherwise the card changes once a
+        # second (countdown) and is only redrawn when something visible changes.
+        while True:
+            await asyncio.sleep(0.1)
+            try:
+                await self._update_overlay()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Overlay update failed")
 
     # --- commands --------------------------------------------------------------
 

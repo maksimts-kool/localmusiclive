@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -256,16 +256,28 @@ Color = Field(None, pattern=r"^#[0-9a-fA-F]{6}$")
 
 class OverlaySettings(BaseModel):
     enabled: bool | None = None
+    mode: Literal["start_end", "always"] | None = None
+    start_seconds: int | None = Field(None, ge=0, le=600)
+    end_seconds: int | None = Field(None, ge=0, le=600)
     show_next: bool | None = None
-    position: Literal[tuple(OVERLAY_POSITIONS)] | None = None  # type: ignore[valid-type]
+    position: Literal[OVERLAY_POSITIONS] | None = None  # type: ignore[valid-type]
     margin: int | None = Field(None, ge=0, le=400)
-    font_family: str | None = Field(None, min_length=1, max_length=80)
-    font_size: int | None = Field(None, ge=10, le=120)
-    text_color: str | None = Color
-    background: bool | None = None
+    scale: int | None = Field(None, ge=50, le=250)
+    accent_color: str | None = Color
     background_color: str | None = Color
     background_opacity: float | None = Field(None, ge=0, le=1)
-    padding: int | None = Field(None, ge=0, le=80)
+    stroke: bool | None = None
+    stroke_color: str | None = Color
+    stroke_opacity: float | None = Field(None, ge=0, le=1)
+    stroke_width: float | None = Field(None, ge=0.5, le=8)
+    radius: int | None = Field(None, ge=0, le=60)
+    shadow: bool | None = None
+    show_thumbnail: bool | None = None
+    show_progress: bool | None = None
+
+
+class OverlayPreview(OverlaySettings):
+    card: Literal["now", "next"] = "now"
 
 
 @app.put("/api/settings/autoplay")
@@ -280,12 +292,11 @@ async def put_overlay(body: OverlaySettings) -> dict:
     return engine.overlay_settings()
 
 
-@app.get("/api/fonts")
-async def fonts() -> list[str]:
-    try:
-        return await ff.request("GET", "/api/text/fonts")
-    except FFplayoutError:
-        return ["DejaVu Sans"]
+@app.post("/api/overlay/preview")
+async def overlay_preview(body: OverlayPreview) -> Response:
+    settings_ = {**engine.overlay_settings(), **body.model_dump(exclude_none=True, exclude={"card"})}
+    png = await asyncio.to_thread(engine.preview_card, settings_, body.card)
+    return Response(png, media_type="image/png", headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/history")
