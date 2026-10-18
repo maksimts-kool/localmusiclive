@@ -81,6 +81,9 @@ OVERLAY_DEFAULTS = {
     "shadow": True,
     "show_thumbnail": True,
     "show_progress": True,
+    # Full-width song progress line along the bottom edge while no card shows.
+    "progress_line": True,
+    "line_height": 4,
 }
 OVERLAY_POSITIONS = (
     "bottom-left", "bottom-center", "bottom-right", "top-left", "top-center", "top-right",
@@ -88,6 +91,8 @@ OVERLAY_POSITIONS = (
 # Card fades in/out over this long; "Up next" is gone this long before the cut.
 CARD_FADE = 0.5
 CARD_END_GAP = 0.2
+# The progress line moves at most this often (seconds), to spare the encoder.
+LINE_STEP = 0.25
 # Where the panel puts the card for ffplayout, relative to the media folder.
 CARD_FILE = ".overlay/card.png"
 
@@ -127,6 +132,7 @@ class Status:
     running: bool = False
     mode: str | None = None
     output: str | None = None
+    watch_port: int | None = None  # HLS mode: the watch service's port
     error: str | None = None
     warnings: list[str] = field(default_factory=list)
 
@@ -158,6 +164,21 @@ def card_phase(position: float, until_next: float | None, settings: dict) -> tup
             opacity = min(opacity, max(until_next - CARD_END_GAP, 0.0) / CARD_FADE)
         return ("now", opacity) if opacity > 0 else None
     return None
+
+
+def line_opacity(position: float, until_next: float | None, length: float, settings: dict) -> float:
+    """How visible the full-width progress line is. It takes over as the
+    "Now playing" card fades out and hands back as "Up next" fades in."""
+    if not settings["progress_line"] or length <= 0:
+        return 0.0
+    opacity = min(1.0, position / CARD_FADE, (length - position) / CARD_FADE)
+    if settings["enabled"]:
+        if settings["mode"] == "always":
+            return 0.0
+        opacity = min(opacity, (position - settings["start_seconds"] + CARD_FADE) / CARD_FADE)
+        if settings["show_next"] and until_next is not None:
+            opacity = min(opacity, (until_next - settings["end_seconds"] + CARD_FADE) / CARD_FADE)
+    return max(0.0, min(opacity, 1.0))
 
 
 def clock(seconds: float) -> str:
@@ -309,18 +330,21 @@ class Engine:
         cfg["playlist"].update(day_start=self.s.day_start, length="24:00:00", infinit=False)
         cfg["processing"]["mode"] = "playlist"
         out = cfg["output"]
-        if self.s.youtube_stream_key:
-            # ffplayout keeps one output record per mode; selecting the
-            # "stream" record by id is what switches the mode.
-            stream = next((o for o in await self.ff.outputs() if o.get("name") == "stream"), None)
-            if stream is None:
-                raise FFplayoutError("ffplayout has no stream output to configure")
-            out.update(
-                id=stream["id"],
-                mode="stream",
-                stream_type="rtmp",
-                stream_url=f"{self.s.youtube_rtmp_url}/{self.s.youtube_stream_key}",
-            )
+        # ffplayout keeps one output record per mode; selecting a record by id
+        # is what switches the mode.
+        mode = "stream" if self.s.rtmp_url else "hls"
+        record = next((o for o in await self.ff.outputs() if o.get("name") == mode), None)
+        if record is None:
+            raise FFplayoutError(f"ffplayout has no {mode} output to configure")
+        out.update(id=record["id"], mode=mode)
+        if mode == "stream":
+            out.update(stream_type="rtmp", stream_url=self.s.rtmp_url)
+        else:
+            # The config still carries the stream record's URL after a switch.
+            out["stream_url"] = ""
+            for key in ("hls_playlist_name", "hls_segment_duration", "hls_list_size"):
+                if record.get(key) is not None:
+                    out[key] = record[key]
         out.update(
             width=self.s.stream_width,
             height=self.s.stream_height,
@@ -347,9 +371,12 @@ class Engine:
 
         if not self.db.get_setting("ffplayout_defaults_applied"):
             # One-time default; change it in ffplayout's UI afterwards.
-            # YouTube plays music at about -14 LUFS; ffplayout defaults to -23.
+            # Streamed music usually plays at about -14 LUFS; ffplayout defaults to -23.
             cfg["audio"]["loudness_target_lufs"] = -14.0
 
+        # Some changes (e.g. switching between HLS and RTMP) make ffplayout stop
+        # the channel; bring back playout that was running.
+        was_active = await self.ff.process("status") == "active"
         restart = False
         if json.dumps(cfg, sort_keys=True) != before:
             result = await self.ff.put_config(cfg)
@@ -376,10 +403,15 @@ class Engine:
         self.status.output = (
             url.rsplit("/", 1)[0] + "/••••" + url[-4:] if out.get("mode") == "stream" and url else None
         )
+        self.status.watch_port = self.s.watch_port if out.get("mode") == "hls" else None
 
-        if restart and await self.ff.process("status") == "active":
-            log.info("Restarting playout to apply the new configuration")
-            await self.ff.process("restart")
+        if was_active:
+            if await self.ff.process("status") != "active":
+                log.info("Starting playout again after the configuration change")
+                await self.ff.process("start")
+            elif restart:
+                log.info("Restarting playout to apply the new configuration")
+                await self.ff.process("restart")
 
     # --- playout events --------------------------------------------------------
 
@@ -771,10 +803,11 @@ class Engine:
             opacity=round(opacity, 2),
         )
 
-    def _current_card(self, settings: dict) -> overlay.Card | None:
+    def _current_overlay(self, settings: dict) -> tuple[overlay.Card | None, tuple[float, float] | None]:
+        """The card and the progress line (fill, opacity) to show right now."""
         cur = self.current
         if not self.status.running or cur is None or not cur.managed:
-            return None
+            return None, None
         position = cur.slot.seek + self._elapsed(cur)
         # The next song starts where this one ends, which for a clip split at
         # midnight is the end of tomorrow's part.
@@ -782,20 +815,29 @@ class Engine:
         nxt = self._next_slot()
         until_next = length - position if nxt else None
         phase = card_phase(position, until_next, settings)
-        if phase is None:
-            return None
-        return self._card_for(phase[0], phase[1], position, until_next, length, cur.slot, nxt)
+        card = None if phase is None else self._card_for(
+            phase[0], phase[1], position, until_next, length, cur.slot, nxt
+        )
+        opacity = line_opacity(position, until_next, length, settings)
+        line = ((position - position % LINE_STEP) / length, opacity) if opacity > 0 else None
+        return card, line
 
     def preview_card(self, settings: dict, phase: str) -> bytes:
-        """The card as it would look now, for the settings dialog."""
-        cur = self.current
-        now_slot = cur.slot if cur is not None and cur.managed else None
-        nxt = self._next_slot()
-        sample = Slot(kind="auto", path="", seek=0, out=212, duration=212, title="Artist – Song title")
-        card = self._card_for(
-            phase, 1.0, 64.0, 148.0, 212.0, now_slot or sample, nxt or now_slot or sample
-        )
-        image = overlay.render(card, {**OVERLAY_DEFAULTS, **settings}, (self.s.stream_width, self.s.stream_height))
+        """The card (or, for "line", the progress line) as it would look now,
+        for the settings dialog."""
+        settings = {**OVERLAY_DEFAULTS, **settings}
+        size = (self.s.stream_width, self.s.stream_height)
+        if phase == "line":
+            image = overlay.compose(None, (64.0 / 212.0, 1.0), settings, size)
+        else:
+            cur = self.current
+            now_slot = cur.slot if cur is not None and cur.managed else None
+            nxt = self._next_slot()
+            sample = Slot(kind="auto", path="", seek=0, out=212, duration=212, title="Artist – Song title")
+            card = self._card_for(
+                phase, 1.0, 64.0, 148.0, 212.0, now_slot or sample, nxt or now_slot or sample
+            )
+            image = overlay.render(card, settings, size)
         buffer = io.BytesIO()
         image.save(buffer, format="PNG", compress_level=1)
         return buffer.getvalue()
@@ -822,22 +864,27 @@ class Engine:
                 log.debug("Could not clear the text overlay: %s", exc)
 
         settings = self.overlay_settings()
-        card = self._current_card(settings)
-        key = None if card is None else (
-            card.heading, card.title, card.artist, card.status, card.time, card.opacity,
-            round(card.progress or 0, 3), str(card.thumb), json.dumps(settings, sort_keys=True),
+        size = (self.s.stream_width, self.s.stream_height)
+        card, line = self._current_overlay(settings)
+        key = (
+            None if card is None else (
+                card.heading, card.title, card.artist, card.status, card.time, card.opacity,
+                round(card.progress or 0, 3), str(card.thumb),
+            ),
+            None if line is None else (overlay.line_pixels(line[0], size), round(line[1], 2)),
+            json.dumps(settings, sort_keys=True),
         )
         if key == self._card_key:
             return
         self._card_key = key
-        size = (self.s.stream_width, self.s.stream_height)
         target = self.s.media_root / CARD_FILE
-        image = overlay.BLANK if card is None else await asyncio.to_thread(overlay.render, card, settings, size)
+        image = await asyncio.to_thread(overlay.compose, card, line, settings, size)
         await asyncio.to_thread(overlay.write, image, target)
 
     async def _overlay_loop(self) -> None:
         # Fades need ~10 updates a second; otherwise the card changes once a
-        # second (countdown) and is only redrawn when something visible changes.
+        # second (countdown), the progress line every LINE_STEP, and the frame
+        # is only redrawn when something visible changes.
         while True:
             await asyncio.sleep(0.1)
             try:
@@ -1048,6 +1095,7 @@ class Engine:
                 "running": self.status.running,
                 "mode": self.status.mode,
                 "output": self.status.output,
+                "watch_port": self.status.watch_port,
                 "error": self.status.error,
                 "warnings": self.status.warnings,
                 "scanning": self.library.scanning,

@@ -28,7 +28,7 @@
 
   const numeric = [
     'margin', 'scale', 'start_seconds', 'end_seconds', 'radius',
-    'stroke_width', 'stroke_opacity', 'background_opacity',
+    'stroke_width', 'stroke_opacity', 'background_opacity', 'line_height',
   ];
 
   function numbers(values) {
@@ -38,12 +38,20 @@
   }
 
   // Which card the preview shows; on the stream they alternate by themselves.
+  // "line" is the progress line shown between the cards.
   let card = $state('now');
+  let lineShown = $derived(ov.progress_line && !(ov.enabled && ov.mode === 'always'));
+  let shown = $derived.by(() => {
+    if (!ov.enabled) return lineShown ? 'line' : 'now';
+    if (ov.mode === 'always') return 'now';
+    if ((card === 'line' && !lineShown) || (card === 'next' && !ov.show_next)) return 'now';
+    return card;
+  });
   let previewUrl = $state(null);
 
   // The preview is the real card, drawn by the panel with the unsaved settings.
   $effect(() => {
-    const body = numbers({ ...ov, card: ov.mode === 'always' ? 'now' : card });
+    const body = numbers({ ...ov, card: shown });
     const controller = new AbortController();
     const timer = setTimeout(async () => {
       try {
@@ -118,19 +126,35 @@
   <section>
     <h3 class="section-title">Song card on the stream</h3>
     <p class="muted hint">
-      Shows the song as it starts and the next one before it ends, with a live countdown.
+      Shows the song as it starts and the next one before it ends, with a live countdown. In
+      between, a thin progress line runs along the bottom edge.
     </p>
 
-    {#if ov.mode === 'start_end'}
+    {#if !(ov.enabled && ov.mode === 'always')}
       <div class="segmented" role="radiogroup" aria-label="Preview">
-        <button role="radio" aria-checked={card === 'now'} class:on={card === 'now'} onclick={() => (card = 'now')}>
+        <button
+          role="radio"
+          aria-checked={shown === 'now'}
+          class:on={shown === 'now'}
+          disabled={!ov.enabled}
+          onclick={() => (card = 'now')}
+        >
           Song start
         </button>
         <button
           role="radio"
-          aria-checked={card === 'next'}
-          class:on={card === 'next'}
-          disabled={!ov.show_next}
+          aria-checked={shown === 'line'}
+          class:on={shown === 'line'}
+          disabled={!lineShown}
+          onclick={() => (card = 'line')}
+        >
+          Mid-song
+        </button>
+        <button
+          role="radio"
+          aria-checked={shown === 'next'}
+          class:on={shown === 'next'}
+          disabled={!ov.enabled || !ov.show_next}
           onclick={() => (card = 'next')}
         >
           Song end
@@ -138,13 +162,16 @@
       </div>
     {/if}
     <div class="preview" style:aspect-ratio="{resolution[0]} / {resolution[1]}">
-      {#if ov.enabled && previewUrl}<img src={previewUrl} alt="Preview of the song card" />{/if}
+      {#if (ov.enabled || shown === 'line') && previewUrl}<img src={previewUrl} alt="Preview of the song card" />{/if}
     </div>
 
     <div class="group">
       <label class="check"><input type="checkbox" bind:checked={ov.enabled} /> Show the song card</label>
       <label class="check">
         <input type="checkbox" bind:checked={ov.show_next} disabled={!ov.enabled} /> Announce the next song
+      </label>
+      <label class="check">
+        <input type="checkbox" bind:checked={ov.progress_line} /> Progress line between the cards
       </label>
     </div>
     <div class="grid">
@@ -219,6 +246,10 @@
       <label class="check"><input type="checkbox" bind:checked={ov.shadow} /> Shadow</label>
       <label class="check"><input type="checkbox" bind:checked={ov.show_thumbnail} /> Thumbnail</label>
       <label class="check"><input type="checkbox" bind:checked={ov.show_progress} /> Progress bar</label>
+      <label>
+        <span>Progress line thickness ({ov.line_height} px)</span>
+        <input type="range" min="1" max="12" step="1" bind:value={ov.line_height} disabled={!ov.progress_line} />
+      </label>
     </div>
     <div class="row-end"><button class="btn primary" onclick={saveOverlay}>Apply on stream</button></div>
   </section>

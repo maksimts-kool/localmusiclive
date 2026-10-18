@@ -28,8 +28,8 @@ services:
       FFPLAYOUT_USER: ${FFPLAYOUT_USER:-admin}
       FFPLAYOUT_PASSWORD: ${FFPLAYOUT_PASSWORD:?Set FFPLAYOUT_PASSWORD in .env}
       FFPLAYOUT_MAIL: ${FFPLAYOUT_MAIL:-admin@localhost.invalid}
-      YOUTUBE_STREAM_KEY: ${YOUTUBE_STREAM_KEY:-}
-      YOUTUBE_RTMP_URL: ${YOUTUBE_RTMP_URL:-rtmp://a.rtmp.youtube.com/live2}
+      RTMP_URL: ${RTMP_URL:-}
+      WATCH_PORT: ${WATCH_PORT:-8090}
       STREAM_WIDTH: ${STREAM_WIDTH:-1280}
       STREAM_HEIGHT: ${STREAM_HEIGHT:-720}
       STREAM_FPS: ${STREAM_FPS:-30}
@@ -46,6 +46,16 @@ services:
       # Writable: YouTube downloads are saved to media/youtube/.
       - ${MEDIA_DIR:-./media}:/media
       - panel-data:/data
+
+  # The stream for TVs and other players on the network (see README, "Watching").
+  watch:
+    build: ./watch
+    restart: unless-stopped
+    depends_on:
+      ffplayout:
+        condition: service_healthy
+    ports:
+      - "${WATCH_BIND_ADDRESS:-0.0.0.0}:${WATCH_PORT:-8090}:80"
 
 volumes:
   playlists:

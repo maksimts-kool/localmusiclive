@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>localmusiclive</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #000;
+    color: #fff;
+    font-family: Inter, "Samsung One", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    overflow: hidden;
+  }
+  video {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    background: #000;
+  }
+  body.idle { cursor: none; }
+  #status {
+    position: fixed;
+    left: 3vw;
+    bottom: 4vh;
+    padding: 0.6em 1em;
+    border-radius: 0.6em;
+    background: rgba(14, 17, 24, 0.85);
+    font-size: 2.2vh;
+    opacity: 0;
+    transition: opacity 0.3s;
+  }
+  #status.on { opacity: 1; }
+  #play {
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    display: none;
+    padding: 0.7em 1.6em;
+    border: 0.12em solid rgba(255, 255, 255, 0.4);
+    border-radius: 0.6em;
+    background: #ff5c7a;
+    color: #fff;
+    font: inherit;
+    font-size: 4vh;
+    font-weight: 600;
+  }
+  #play:focus { outline: 0.12em solid #fff; outline-offset: 0.2em; }
+  #play.on { display: block; }
+</style>
+</head>
+<body>
+<video id="video" autoplay playsinline></video>
+<button id="play" type="button">&#9654;&nbsp; Play</button>
+<div id="status"></div>
+<script src="hls.min.js"></script>
+<script>
+  // Written for old TV browsers (Tizen 4+): ES5, no optional chaining.
+  (function () {
+    var SRC = 'live/stream.m3u8';
+    var video = document.getElementById('video');
+    var playButton = document.getElementById('play');
+    var statusBox = document.getElementById('status');
+    var forceNative = /[?&]native=1/.test(location.search);
+    var hls = null;
+    var retryTimer = null;
+    var lastTime = -1;
+    var stalledFor = 0;
+
+    function status(text) {
+      statusBox.textContent = text || '';
+      statusBox.className = text ? 'on' : '';
+    }
+
+    function play() {
+      var p = video.play();
+      if (p && p.then) {
+        p.then(function () {
+          playButton.className = '';
+        }, function () {
+          // Autoplay with sound blocked: one press of OK on the remote starts it.
+          playButton.className = 'on';
+          playButton.focus();
+        });
+      }
+    }
+
+    function retry(text, delay) {
+      status(text);
+      clearTimeout(retryTimer);
+      retryTimer = setTimeout(start, delay);
+    }
+
+    function start() {
+      clearTimeout(retryTimer);
+      lastTime = -1;
+      stalledFor = 0;
+      if (hls) {
+        hls.destroy();
+        hls = null;
+      }
+      status('Connecting…');
+      var url = SRC + '?t=' + Date.now();
+      if (!forceNative && window.Hls && Hls.isSupported()) {
+        hls = new Hls({ liveSyncDurationCount: 3, liveMaxLatencyDurationCount: 10 });
+        hls.on(Hls.Events.MANIFEST_PARSED, play);
+        hls.on(Hls.Events.ERROR, function (event, data) {
+          if (!data.fatal) return;
+          if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+            hls.recoverMediaError();
+          } else {
+            retry('Stream offline, retrying…', 5000);
+          }
+        });
+        hls.loadSource(url);
+        hls.attachMedia(video);
+      } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        video.src = url;
+        video.load();
+        play();
+      } else {
+        status('This browser cannot play the stream. Try an IPTV app with /channel.m3u');
+      }
+    }
+
+    video.addEventListener('playing', function () { status(''); });
+    video.addEventListener('waiting', function () { status('Buffering…'); });
+    video.addEventListener('error', function () {
+      if (!hls) retry('Stream offline, retrying…', 5000);
+    });
+    video.addEventListener('ended', function () { retry('Stream ended, retrying…', 3000); });
+
+    // Watchdog: if the picture freezes for 20 s while it should be playing, start over.
+    setInterval(function () {
+      if (video.paused) return;
+      if (video.currentTime === lastTime) {
+        stalledFor += 5;
+        if (stalledFor >= 20) retry('Reconnecting…', 0);
+      } else {
+        stalledFor = 0;
+        lastTime = video.currentTime;
+      }
+    }, 5000);
+
+    playButton.addEventListener('click', function () {
+      var el = document.documentElement;
+      var fs = el.requestFullscreen || el.webkitRequestFullscreen;
+      if (fs) {
+        try { fs.call(el); } catch (e) { /* not allowed here */ }
+      }
+      play();
+    });
+
+    // TV remote: OK/Enter or Play starts playback.
+    document.addEventListener('keydown', function (e) {
+      if ((e.keyCode === 13 || e.keyCode === 415 || e.keyCode === 10252) && video.paused) {
+        e.preventDefault();
+        play();
+      }
+    });
+
+    // Hide the mouse pointer (or the TV's remote pointer) when it isn't moving.
+    var idleTimer = null;
+    document.addEventListener('mousemove', function () {
+      document.body.className = '';
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(function () { document.body.className = 'idle'; }, 3000);
+    });
+
+    start();
+  })();
+</script>
+</body>
+</html>

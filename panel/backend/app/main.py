@@ -274,10 +274,12 @@ class OverlaySettings(BaseModel):
     shadow: bool | None = None
     show_thumbnail: bool | None = None
     show_progress: bool | None = None
+    progress_line: bool | None = None
+    line_height: int | None = Field(None, ge=1, le=20)
 
 
 class OverlayPreview(OverlaySettings):
-    card: Literal["now", "next"] = "now"
+    card: Literal["now", "next", "line"] = "now"
 
 
 @app.put("/api/settings/autoplay")

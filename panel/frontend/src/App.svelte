@@ -58,15 +58,20 @@
     if (!status) return { text: 'Connecting…', tone: 'idle' };
     if (status.ffplayout !== 'ok') return { text: `ffplayout ${status.ffplayout}`, tone: 'warn' };
     if (!running) return { text: 'Stopped', tone: 'idle' };
-    return status.mode === 'stream' ? { text: 'On air', tone: 'live' } : { text: 'Preview', tone: 'preview' };
+    return ['stream', 'hls'].includes(status.mode) ? { text: 'On air', tone: 'live' } : { text: status.mode, tone: 'preview' };
   });
 
   let output = $derived.by(() => {
     if (!status?.mode) return '';
-    if (status.mode === 'stream') return status.output ? `YouTube · ${status.output}` : 'Stream';
-    if (status.mode === 'hls') return 'HLS preview (no stream key set)';
+    if (status.mode === 'stream') return status.output ? `RTMP · ${status.output}` : 'RTMP stream';
+    if (status.mode === 'hls') return status.watch_port ? `On your network · port ${status.watch_port}` : 'HLS';
     return status.mode;
   });
+
+  // The watch page as seen from this browser; on the TV use this Mac's network address.
+  let watchUrl = $derived(
+    status?.mode === 'hls' && status.watch_port ? `http://${location.hostname}:${status.watch_port}/` : null,
+  );
 
   function playout(command) {
     if (command === 'stop' && !confirm('Stop the stream? Viewers will see it end.')) return;
@@ -86,7 +91,9 @@
 
   <div class="status">
     <span class="pill {pill.tone}"><span class="dot"></span>{pill.text}</span>
-    {#if output}<span class="output ellipsis muted">{output}</span>{/if}
+    {#if watchUrl}
+      <a class="output ellipsis muted" href={watchUrl} target="_blank" rel="noreferrer" title="Open the watch page">{output}</a>
+    {:else if output}<span class="output ellipsis muted">{output}</span>{/if}
   </div>
 
   <div class="controls">

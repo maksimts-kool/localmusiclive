@@ -213,7 +213,40 @@ def render(card: Card, settings: dict, size: tuple[int, int]) -> Image.Image:
     return layer
 
 
+def render_line(progress: float, opacity: float, settings: dict, size: tuple[int, int]) -> Image.Image:
+    """The song's progress as a thin bar across the whole frame, at the bottom
+    edge, drawn like the card's bar (faint track, accent fill)."""
+    frame_w, frame_h = size
+    height = max(1, round(settings["line_height"] * frame_h / 720))
+    alpha = max(0.0, min(opacity, 1.0))
+    layer = Image.new("RGBA", size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(layer)
+    top = frame_h - height
+    draw.rectangle((0, top, frame_w - 1, frame_h - 1), fill=(255, 255, 255, round(46 * alpha)))
+    fill_to = round(frame_w * max(0.0, min(progress, 1.0)))
+    if fill_to > 0:
+        draw.rectangle((0, top, fill_to - 1, frame_h - 1), fill=rgba(settings["accent_color"], alpha))
+    return layer
+
+
+def line_pixels(progress: float, size: tuple[int, int]) -> int:
+    """How many pixels of the line are filled; the line is redrawn only when this changes."""
+    return round(size[0] * max(0.0, min(progress, 1.0)))
+
+
 BLANK = Image.new("RGBA", (2, 2), (0, 0, 0, 0))
+
+
+def compose(card: Card | None, line: tuple[float, float] | None, settings: dict,
+            size: tuple[int, int]) -> Image.Image:
+    """The whole overlay frame: the progress line (fill, opacity) under the card."""
+    if card is None and line is None:
+        return BLANK
+    layer = render_line(line[0], line[1], settings, size) if line else None
+    if card is not None:
+        drawn = render(card, settings, size)
+        layer = drawn if layer is None else Image.alpha_composite(layer, drawn)
+    return layer
 
 
 def write(image: Image.Image, target: Path) -> None:

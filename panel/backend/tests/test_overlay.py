@@ -1,7 +1,7 @@
 from pathlib import Path
 
-from app.engine import OVERLAY_DEFAULTS, card_phase, clock
-from app.overlay import Card, render
+from app.engine import OVERLAY_DEFAULTS, card_phase, clock, line_opacity
+from app.overlay import BLANK, Card, compose, render
 
 S = OVERLAY_DEFAULTS  # start 15 s, end 20 s
 
@@ -65,3 +65,33 @@ def test_render_fades():
     card = Card("Up next", "Song", "", "Starts in {time}", "0:10", None, Path("/nope.jpg"), 0.5)
     alpha = render(card, S, (1280, 720)).getchannel("A")
     assert 0 < alpha.getextrema()[1] <= 128
+
+
+def test_line_between_the_cards():
+    # 200 s song, next one follows: hidden under both cards, crossfades at the edges.
+    assert line_opacity(5, 195, 200, S) == 0
+    assert line_opacity(14.75, 185.25, 200, S) == 0.5
+    assert line_opacity(100, 100, 200, S) == 1
+    assert line_opacity(200 - 19.75, 19.75, 200, S) == 0.5
+    assert line_opacity(190, 10, 200, S) == 0
+
+
+def test_line_without_up_next_runs_to_the_end():
+    assert line_opacity(190, None, 200, S) == 1
+    assert line_opacity(190, 10, 200, {**S, "show_next": False}) == 1
+    assert line_opacity(199.75, None, 200, S) == 0.5
+
+
+def test_line_without_card_and_off():
+    assert line_opacity(3, 197, 200, {**S, "enabled": False}) == 1
+    assert line_opacity(100, 100, 200, {**S, "mode": "always"}) == 0
+    assert line_opacity(100, 100, 200, {**S, "progress_line": False}) == 0
+
+
+def test_compose_draws_full_width_line_at_the_bottom():
+    image = compose(None, (0.25, 1.0), S, (1280, 720))
+    box = image.getchannel("A").getbbox()
+    assert box == (0, 716, 1280, 720)
+    assert image.getpixel((100, 718))[:3] == (0xFF, 0x5C, 0x7A)  # filled: accent
+    assert image.getpixel((1000, 718))[3] < 60  # rest: faint track
+    assert compose(None, None, S, (1280, 720)) is BLANK

@@ -1,12 +1,13 @@
 # localmusiclive
 
-A 24/7 music-video channel for YouTube Live, run from a Mac with Docker.
+A 24/7 music-video channel, run from a Mac with Docker and watched on your own
+network, for example in a Samsung (Tizen) TV's browser.
 [ffplayout](https://github.com/ffplayout/ffplayout) does the playout and
 streaming; a small control panel owns the queue: drag to reorder, skip,
 autoplay when the queue runs dry, and a "Now · Next" lower third on the stream.
 
 ```
- browser ──WebSocket──▶ panel (FastAPI + Svelte, :8080) ──REST──▶ ffplayout (:8787) ──RTMP──▶ YouTube
+ browser ──WebSocket──▶ panel (FastAPI + Svelte, :8080) ──REST──▶ ffplayout (:8787) ──HLS──▶ watch (nginx, :8090) ──▶ TV
                             ▲          SQLite in /data               │
                             └──────── server-sent events ────────────┘
                      both read the clips from ./media (mounted at /media)
@@ -20,14 +21,13 @@ autoplay when the queue runs dry, and a "Now · Next" lower third on the stream.
    cp .env.example .env
    ```
 
-   Set `FFPLAYOUT_PASSWORD` and, when you're ready to go live, `YOUTUBE_STREAM_KEY`
-   (YouTube Studio → Go live → Stream). Without a key, ffplayout stays in HLS
-   preview mode, so you can try everything without going live.
+   Set `FFPLAYOUT_PASSWORD`. Nothing else is needed: the stream is served on
+   your network (see [Watching](#watching-on-a-tv)).
 
 2. Put video clips in `media/` (subfolders are fine). Tag them with artist and
    title, or name them `Artist - Title.mp4`.
 
-3. Start both containers:
+3. Start the containers:
 
    ```bash
    docker compose up -d --build
@@ -42,11 +42,43 @@ The panel sets up ffplayout on first run (admin account, paths, playlist mode,
 output). ffplayout's own admin UI stays available at <http://localhost:8787>; log
 in with `FFPLAYOUT_USER` / `FFPLAYOUT_PASSWORD`.
 
-Without a stream key, watch the preview with any HLS player, for example:
+## Watching on a TV
 
-```bash
-ffplay http://localhost:8787/public/1/live/stream.m3u8
-```
+There is no streaming service in between, so nothing gets muted, claimed or
+taken down: ffplayout writes the stream as HLS and the `watch` container serves
+it on port 8090 (`WATCH_PORT`) to anything on your network. Only the stream and
+its player page are reachable there; the panel and ffplayout stay on
+`BIND_ADDRESS` (this Mac only, by default).
+
+Find the Mac's address with `ipconfig getifaddr en0` (Wi-Fi; try `en1` for
+Ethernet), say `192.168.1.20`, then on the TV:
+
+- **Browser** (Samsung's Internet app on Tizen): open `http://192.168.1.20:8090`.
+  It plays full screen; if the TV blocks sound on autoplay, a Play button shows,
+  press OK on the remote. Add it as a bookmark or to the home screen. If the
+  player stutters on an older TV, try `http://192.168.1.20:8090/?native=1`,
+  which uses the TV's own HLS player instead of hls.js.
+- **IPTV app** (any app from the TV's app store that takes an M3U playlist URL):
+  add `http://192.168.1.20:8090/channel.m3u`. The raw stream is
+  `http://192.168.1.20:8090/live/stream.m3u8`, for VLC or any other player.
+
+The status bar in the panel shows "On your network" with a link to the watch
+page. The first time, macOS may ask whether Docker may accept incoming
+connections; allow it. Give the Mac a fixed address in your router so the
+bookmark keeps working. Viewers are about 20 seconds behind (three 6-second HLS
+segments; ffplayout's UI has the segment settings).
+
+To watch away from home, put the Mac on a VPN such as Tailscale (also on the
+phone or laptop you watch on) rather than forwarding the port to the internet.
+
+### Streaming to a server instead
+
+`RTMP_URL` (stream key included, e.g. `rtmp://owncast.local:1935/live/KEY`) makes
+ffplayout push to an RTMP server instead, such as a self-hosted
+[Owncast](https://owncast.online) or a platform. ffplayout has one output at a
+time, so the watch page has no stream while it's set. Hosted platforms (YouTube,
+Twitch, Kick, Facebook) all act on copyright claims, so music videos you don't
+have rights to will be muted or taken down there.
 
 ## Using the panel
 
@@ -105,8 +137,14 @@ before it ends ("Up next", with a countdown). By default it shows for the first
 Position, size, accent and background colours, border, corner radius, shadow,
 thumbnail and progress bar are set in the panel's settings.
 
-The panel draws the card as a transparent PNG (`media/.overlay/card.png`) up to
-ten times a second while it fades, and once a second otherwise for the countdown.
+In between the cards, a thin progress line runs along the bottom edge of the
+picture, the width of the screen, in the accent colour (it crossfades with the
+cards). Turn it off or change its thickness in the settings; "Mid-song" in the
+preview shows it. With the card set to show all the time, there is no line.
+
+The panel draws the card and line as a transparent PNG (`media/.overlay/card.png`)
+up to ten times a second while it fades, once a second otherwise for the countdown,
+and up to four times a second while the line moves.
 ffplayout shows it through its logo slot. Stock ffplayout reads the logo only
 once per clip, so the ffplayout image is built from source with
 `ffplayout/live-logo.patch`, which reloads the logo whenever the file changes.
@@ -119,8 +157,8 @@ scripts (e.g. Japanese) show as boxes.
 
 | Setting | Where |
 |---|---|
-| Stream key, resolution, frame rate, video/audio bitrate, x264 preset | `.env`, applied to ffplayout each time the panel starts |
-| Admin login, ports, media folder, time zone, YouTube download limits | `.env` |
+| Output (HLS or `RTMP_URL`), resolution, frame rate, video/audio bitrate, x264 preset | `.env`, applied to ffplayout each time the panel starts |
+| Admin login, ports (incl. `WATCH_PORT`), media folder, time zone, YouTube download limits | `.env` |
 | Queue, autoplay, song card | the panel |
 | ffplayout's logo slot | the panel (it shows the song card), so don't set a logo in ffplayout |
 | Everything else in ffplayout (loudness, fillers, …) | ffplayout's UI at :8787 |
@@ -128,7 +166,7 @@ scripts (e.g. Japanese) show as boxes.
 Change `.env`, then `docker compose up -d` to apply. Two things are set only on
 the very first run: the ffplayout password (change it in ffplayout's UI *and*
 `.env` afterwards) and the loudness target, which the panel sets once to −14 LUFS
-(YouTube's level; ffplayout defaults to −23).
+(the usual level for streamed music; ffplayout defaults to −23).
 
 Output is H.264 (x264, `veryfast`, constant bitrate) + AAC with a 2-second
 keyframe interval, which ffplayout always uses for stream output. Docker on a Mac
@@ -195,14 +233,14 @@ cd panel/frontend && npm install && npm run dev
 ```
 
 To try changes without touching the live channel, run a second stack under
-another project name, with other ports, no stream key and a test media folder
+another project name, with other ports, no `RTMP_URL` and a test media folder
 (shell variables override `.env`):
 
 ```bash
-MEDIA_DIR=/path/to/test-clips YOUTUBE_STREAM_KEY= PANEL_PORT=18080 FFPLAYOUT_PORT=18787 docker compose -p lmltest up -d --build
+MEDIA_DIR=/path/to/test-clips RTMP_URL= PANEL_PORT=18080 FFPLAYOUT_PORT=18787 WATCH_PORT=18090 docker compose -p lmltest up -d --build
 ```
 
 Remove it afterwards with `docker compose -p lmltest down -v`.
 
 The queue table already records who requested a song (`requested_by`), ready for
-viewer requests from YouTube live chat later.
+viewer requests later.

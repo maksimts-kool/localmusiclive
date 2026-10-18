@@ -16,10 +16,10 @@ class Settings:
     ffplayout_mail: str = os.environ.get("FFPLAYOUT_MAIL", "admin@localhost.invalid")
     channel_id: int = _int("FFPLAYOUT_CHANNEL", 1)
 
-    youtube_stream_key: str = os.environ.get("YOUTUBE_STREAM_KEY", "").strip()
-    youtube_rtmp_url: str = os.environ.get(
-        "YOUTUBE_RTMP_URL", "rtmp://a.rtmp.youtube.com/live2"
-    ).rstrip("/")
+    # Empty: ffplayout writes HLS, which the watch service serves on the LAN.
+    # Set: ffplayout pushes to this RTMP URL (stream key included) instead.
+    rtmp_url: str = os.environ.get("RTMP_URL", "").strip()
+    watch_port: int = _int("WATCH_PORT", 8090)
     stream_width: int = _int("STREAM_WIDTH", 1280)
     stream_height: int = _int("STREAM_HEIGHT", 720)
     stream_fps: int = _int("STREAM_FPS", 30)
