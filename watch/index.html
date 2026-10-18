@@ -52,12 +52,26 @@
   }
   #play:focus { outline: 0.12em solid #fff; outline-offset: 0.2em; }
   #play.on { display: block; }
+  #hint {
+    position: fixed;
+    right: 3vw;
+    top: 4vh;
+    padding: 0.6em 1em;
+    border-radius: 0.6em;
+    background: rgba(14, 17, 24, 0.85);
+    font-size: 2.2vh;
+    opacity: 0;
+    transition: opacity 0.5s;
+  }
+  #hint.on { opacity: 1; }
+  #hint b { color: #ff5c7a; }
 </style>
 </head>
 <body>
 <video id="video" autoplay playsinline></video>
 <button id="play" type="button">&#9654;&nbsp; Play</button>
 <div id="status"></div>
+<div id="hint">Press <b>OK</b> for full screen</div>
 <script src="hls.min.js"></script>
 <script>
   // Written for old TV browsers (Tizen 4+): ES5, no optional chaining.
@@ -66,6 +80,7 @@
     var video = document.getElementById('video');
     var playButton = document.getElementById('play');
     var statusBox = document.getElementById('status');
+    var hintBox = document.getElementById('hint');
     var forceNative = /[?&]native=1/.test(location.search);
     var hls = null;
     var retryTimer = null;
@@ -107,7 +122,17 @@
       status('Connecting…');
       var url = SRC + '?t=' + Date.now();
       if (!forceNative && window.Hls && Hls.isSupported()) {
-        hls = new Hls({ liveSyncDurationCount: 3, liveMaxLatencyDurationCount: 10 });
+        hls = new Hls({
+          // Play 4 s behind the newest video (2 segments); if it falls more than
+          // 10 s behind (after a stall), jump forward instead of staying late.
+          // In seconds, because counts multiply the playlist's rounded-up
+          // target duration (3 s for 2 s segments cut at uneven keyframes).
+          liveSyncDuration: 4,
+          liveMaxLatencyDuration: 10,
+          maxBufferLength: 10,
+          backBufferLength: 10,
+        });
+        window.hlsPlayer = hls; // for checking hlsPlayer.latency from the console
         hls.on(Hls.Events.MANIFEST_PARSED, play);
         hls.on(Hls.Events.ERROR, function (event, data) {
           if (!data.fatal) return;
@@ -136,8 +161,13 @@
     video.addEventListener('ended', function () { retry('Stream ended, retrying…', 3000); });
 
     // Watchdog: if the picture freezes for 20 s while it should be playing, start over.
+    // The TV's own player picks its start point itself; pull it back near live.
     setInterval(function () {
       if (video.paused) return;
+      if (!hls && video.seekable.length) {
+        var edge = video.seekable.end(video.seekable.length - 1);
+        if (edge - video.currentTime > 10) video.currentTime = edge - 4;
+      }
       if (video.currentTime === lastTime) {
         stalledFor += 5;
         if (stalledFor >= 20) retry('Reconnecting…', 0);
@@ -147,20 +177,56 @@
       }
     }, 5000);
 
-    playButton.addEventListener('click', function () {
+    // Full screen. Browsers only allow it in answer to a key press or click,
+    // so the first OK on the remote does it (and starts playback if needed).
+    function isFullscreen() {
+      return Boolean(document.fullscreenElement || document.webkitFullscreenElement);
+    }
+
+    function enterFullscreen() {
+      if (isFullscreen()) return;
       var el = document.documentElement;
       var fs = el.requestFullscreen || el.webkitRequestFullscreen;
-      if (fs) {
-        try { fs.call(el); } catch (e) { /* not allowed here */ }
+      try {
+        var p = fs ? fs.call(el) : null;
+        if (p && p.then) p.then(null, videoFullscreen);
+        else if (!fs) videoFullscreen();
+      } catch (e) {
+        videoFullscreen();
       }
-      play();
-    });
+    }
 
-    // TV remote: OK/Enter or Play starts playback.
+    function videoFullscreen() {
+      // Older players can only put the video itself in full screen.
+      var fs = video.requestFullscreen || video.webkitRequestFullscreen || video.webkitEnterFullscreen;
+      try { if (fs) fs.call(video); } catch (e) { /* not supported */ }
+    }
+
+    var hintTimer = null;
+    function hint() {
+      clearTimeout(hintTimer);
+      hintBox.className = isFullscreen() ? '' : 'on';
+      hintTimer = setTimeout(function () { hintBox.className = ''; }, 10000);
+    }
+
+    function activate() {
+      enterFullscreen();
+      if (video.paused) play();
+    }
+
+    document.addEventListener('fullscreenchange', hint);
+    document.addEventListener('webkitfullscreenchange', hint);
+    playButton.addEventListener('click', function (e) {
+      e.stopPropagation();
+      activate();
+    });
+    document.addEventListener('click', activate);
+
+    // TV remote: OK/Enter or Play goes full screen and starts playback.
     document.addEventListener('keydown', function (e) {
-      if ((e.keyCode === 13 || e.keyCode === 415 || e.keyCode === 10252) && video.paused) {
+      if (e.keyCode === 13 || e.keyCode === 415 || e.keyCode === 10252) {
         e.preventDefault();
-        play();
+        activate();
       }
     });
 
@@ -168,11 +234,13 @@
     var idleTimer = null;
     document.addEventListener('mousemove', function () {
       document.body.className = '';
+      if (!isFullscreen() && hintBox.className !== 'on') hint();
       clearTimeout(idleTimer);
       idleTimer = setTimeout(function () { document.body.className = 'idle'; }, 3000);
     });
 
     start();
+    hint();
   })();
 </script>
 </body>

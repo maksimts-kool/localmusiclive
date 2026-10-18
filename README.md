@@ -65,8 +65,15 @@ Ethernet), say `192.168.1.20`, then on the TV:
 The status bar in the panel shows "On your network" with a link to the watch
 page. The first time, macOS may ask whether Docker may accept incoming
 connections; allow it. Give the Mac a fixed address in your router so the
-bookmark keeps working. Viewers are about 20 seconds behind (three 6-second HLS
-segments; ffplayout's UI has the segment settings).
+bookmark keeps working.
+
+Viewers are about 5–7 seconds behind live: the stream is cut into 2-second HLS
+segments (`HLS_SEGMENT_SECONDS`, the shortest possible, since ffplayout puts a
+keyframe every 2 seconds) and the player stays 2 segments behind the newest one,
+jumping forward if it falls further behind. If a TV on weak Wi-Fi keeps
+buffering, set `HLS_SEGMENT_SECONDS=4` (or 6) and `docker compose up -d`; the delay
+grows by the same factor. The panel sets these in ffplayout each time it starts,
+so change them in `.env`, not in ffplayout's UI.
 
 To watch away from home, put the Mac on a VPN such as Tailscale (also on the
 phone or laptop you watch on) rather than forwarding the port to the internet.
@@ -157,7 +164,7 @@ scripts (e.g. Japanese) show as boxes.
 
 | Setting | Where |
 |---|---|
-| Output (HLS or `RTMP_URL`), resolution, frame rate, video/audio bitrate, x264 preset | `.env`, applied to ffplayout each time the panel starts |
+| Output (HLS segment length or `RTMP_URL`), resolution, frame rate, video/audio bitrate, x264 preset | `.env`, applied to ffplayout each time the panel starts |
 | Admin login, ports (incl. `WATCH_PORT`), media folder, time zone, YouTube download limits | `.env` |
 | Queue, autoplay, song card | the panel |
 | ffplayout's logo slot | the panel (it shows the song card), so don't set a logo in ffplayout |

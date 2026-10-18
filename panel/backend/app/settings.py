@@ -20,6 +20,10 @@ class Settings:
     # Set: ffplayout pushes to this RTMP URL (stream key included) instead.
     rtmp_url: str = os.environ.get("RTMP_URL", "").strip()
     watch_port: int = _int("WATCH_PORT", 8090)
+    # Short segments and a short playlist keep viewers close to live. ffplayout
+    # puts a keyframe every 2 s, so segments can't be shorter than that.
+    hls_segment_seconds: int = _int("HLS_SEGMENT_SECONDS", 2)
+    hls_list_size: int = _int("HLS_LIST_SIZE", 10)
     stream_width: int = _int("STREAM_WIDTH", 1280)
     stream_height: int = _int("STREAM_HEIGHT", 720)
     stream_fps: int = _int("STREAM_FPS", 30)

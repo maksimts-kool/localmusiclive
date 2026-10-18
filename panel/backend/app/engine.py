@@ -341,10 +341,12 @@ class Engine:
             out.update(stream_type="rtmp", stream_url=self.s.rtmp_url)
         else:
             # The config still carries the stream record's URL after a switch.
-            out["stream_url"] = ""
-            for key in ("hls_playlist_name", "hls_segment_duration", "hls_list_size"):
-                if record.get(key) is not None:
-                    out[key] = record[key]
+            out.update(
+                stream_url="",
+                hls_playlist_name=record.get("hls_playlist_name") or "stream",
+                hls_segment_duration=max(1, self.s.hls_segment_seconds),
+                hls_list_size=max(3, self.s.hls_list_size),
+            )
         out.update(
             width=self.s.stream_width,
             height=self.s.stream_height,
