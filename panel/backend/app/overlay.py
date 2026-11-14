@@ -213,40 +213,202 @@ def render(card: Card, settings: dict, size: tuple[int, int]) -> Image.Image:
     return layer
 
 
-def render_line(progress: float, opacity: float, settings: dict, size: tuple[int, int]) -> Image.Image:
-    """The song's progress as a thin bar across the whole frame, at the bottom
-    edge, drawn like the card's bar (faint track, accent fill)."""
+# Colours of the queued songs on the progress line and the queue card. The song
+# on air is always the accent colour; queued songs take these in turn.
+SEGMENT_COLORS = ("#5cc8ff", "#ffd166", "#7bd88f", "#b18cff", "#ff9f5c")
+
+
+def segment_color(index: int, settings: dict) -> str:
+    return settings["accent_color"] if index == 0 else SEGMENT_COLORS[(index - 1) % len(SEGMENT_COLORS)]
+
+
+@dataclass
+class Line:
+    """The full-width progress line: one segment per song (the one on air, then
+    the queued ones), each as wide as the song is long. `position` is seconds
+    from the start of the first segment."""
+    lengths: tuple[float, ...]
+    position: float
+    opacity: float
+
+
+def line_edges(lengths: tuple[float, ...], frame_w: int) -> list[tuple[int, int]]:
+    """Pixel span (x0, x1 exclusive) of each segment, with a small gap between them."""
+    total = sum(lengths)
+    if total <= 0:
+        return []
+    gap = max(2, round(frame_w / 640)) if len(lengths) > 1 else 0
+    edges, start = [], 0.0
+    for length in lengths:
+        x0 = round(frame_w * start / total)
+        start += length
+        x1 = round(frame_w * start / total)
+        edges.append((x0, x1))
+    # Cut the gap out of the end of every segment but the last.
+    return [(x0, max(x0, x1 - gap) if i < len(edges) - 1 else x1) for i, (x0, x1) in enumerate(edges)]
+
+
+def render_line(line: Line, settings: dict, size: tuple[int, int]) -> Image.Image:
+    """The progress line across the bottom edge: each song a segment in its own
+    colour, faint ahead of the playhead and solid behind it."""
     frame_w, frame_h = size
     height = max(1, round(settings["line_height"] * frame_h / 720))
-    alpha = max(0.0, min(opacity, 1.0))
+    alpha = max(0.0, min(line.opacity, 1.0))
     layer = Image.new("RGBA", size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(layer)
     top = frame_h - height
-    draw.rectangle((0, top, frame_w - 1, frame_h - 1), fill=(255, 255, 255, round(46 * alpha)))
-    fill_to = round(frame_w * max(0.0, min(progress, 1.0)))
-    if fill_to > 0:
-        draw.rectangle((0, top, fill_to - 1, frame_h - 1), fill=rgba(settings["accent_color"], alpha))
+    fill_to = line_pixels(line, size)
+    for i, (x0, x1) in enumerate(line_edges(line.lengths, frame_w)):
+        if x1 <= x0:
+            continue
+        color = segment_color(i, settings)
+        draw.rectangle((x0, top, x1 - 1, frame_h - 1), fill=rgba(color, 0.5 * alpha))
+        if fill_to > x0:
+            draw.rectangle((x0, top, min(fill_to, x1) - 1, frame_h - 1), fill=rgba(color, alpha))
     return layer
 
 
-def line_pixels(progress: float, size: tuple[int, int]) -> int:
+def line_pixels(line: Line, size: tuple[int, int]) -> int:
     """How many pixels of the line are filled; the line is redrawn only when this changes."""
-    return round(size[0] * max(0.0, min(progress, 1.0)))
+    total = sum(line.lengths)
+    if total <= 0:
+        return 0
+    return round(size[0] * max(0.0, min(line.position / total, 1.0)))
+
+
+# Sizes of the queue card at 720p and 100 % scale.
+QUEUE_BASE = {
+    "padding": 12,
+    "heading": 11,
+    "row": 14,
+    "row_height": 22,
+    "dot": 8,
+    "min_width": 220,
+}
+
+
+@dataclass
+class QueueItem:
+    title: str
+    artist: str
+    time: str  # its length, "3:42"
+    color: str
+
+
+@dataclass
+class QueueCard:
+    """A small card listing what's queued after the song on air."""
+    items: list[QueueItem]
+    more: int  # queued songs not listed
+    opacity: float = 1.0
+
+
+def queue_corner(settings: dict) -> tuple[str, str]:
+    """The queue card goes in the opposite corner to the song card: the other
+    edge (top/bottom) and the right side, or the left if the song card is right."""
+    vertical, horizontal = settings["position"].split("-")
+    return ("bottom" if vertical == "top" else "top"), ("left" if horizontal == "right" else "right")
+
+
+def render_queue(card: QueueCard, settings: dict, size: tuple[int, int]) -> Image.Image:
+    frame_w, frame_h = size
+    k = frame_h / 720 * settings["scale"] / 100
+    px = {name: max(1, round(value * k)) for name, value in QUEUE_BASE.items()}
+    f_heading = font("heading", px["heading"])
+    f_row = font("status", px["row"])
+    f_soft = font("body", px["row"])
+    probe = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+    pad = px["padding"]
+    dot_gap = round(8 * k)
+    col_gap = round(14 * k)
+
+    heading = spaced("QUEUE")
+    count = str(len(card.items) + card.more)
+    times_w = max((time_width(probe, item.time, f_row) for item in card.items), default=0)
+    max_label = round(frame_w * 0.3) - 2 * pad - px["dot"] - dot_gap - col_gap - times_w
+
+    rows = []
+    for item in card.items:
+        title = fit(probe, item.title, f_row, max_label)
+        rest = max_label - probe.textlength(title, font=f_row)
+        artist = ""
+        if item.artist and rest > probe.textlength("  ·  …", font=f_soft) + 20 * k:
+            artist = fit(probe, "  ·  " + item.artist, f_soft, rest)
+        rows.append((item, title, artist))
+    more = f"+{card.more} more" if card.more else ""
+
+    label_w = max(
+        (probe.textlength(t, font=f_row) + (probe.textlength(a, font=f_soft) if a else 0) for _, t, a in rows),
+        default=0,
+    )
+    row_w = px["dot"] + dot_gap + label_w + col_gap + times_w
+    head_w = probe.textlength(heading, font=f_heading) + round(8 * k) + probe.textlength(count, font=f_heading)
+    card_w = max(px["min_width"], round(2 * pad + max(row_w, head_w, probe.textlength(more, font=f_soft))))
+    head_h = round(px["heading"] * 1.9)
+    card_h = 2 * pad + head_h + px["row_height"] * (len(rows) + (1 if more else 0))
+
+    margin = round(settings["margin"] * frame_h / 720)
+    vertical, horizontal = queue_corner(settings)
+    x = margin if horizontal == "left" else frame_w - margin - card_w
+    y = margin if vertical == "top" else frame_h - margin - card_h
+
+    layer = Image.new("RGBA", size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(layer)
+    stroke = max(1, round(settings["stroke_width"] * k)) if settings["stroke"] else 0
+    draw.rounded_rectangle(
+        (x, y, x + card_w, y + card_h), round(settings["radius"] * k * 0.7),
+        fill=rgba(settings["background_color"], settings["background_opacity"]),
+        outline=rgba(settings["stroke_color"], settings["stroke_opacity"]) if stroke else None,
+        width=stroke,
+    )
+
+    white = (255, 255, 255, 255)
+    soft = (255, 255, 255, 170)
+    faint = (255, 255, 255, 130)
+    tx, ty = x + pad, y + pad
+    draw.text((tx, ty), heading, font=f_heading, fill=faint)
+    draw.text((tx + probe.textlength(heading, font=f_heading) + round(8 * k), ty), count, font=f_heading, fill=white)
+    ty += head_h
+
+    ascent = f_row.getmetrics()[0]
+    for item, title, artist in rows:
+        cy = ty + round(ascent * 0.62)
+        r = px["dot"] / 2
+        draw.ellipse((tx, cy - r, tx + px["dot"], cy + r), fill=rgba(item.color, 1))
+        lx = tx + px["dot"] + dot_gap
+        draw.text((lx, ty), title, font=f_row, fill=white)
+        if artist:
+            draw.text((lx + probe.textlength(title, font=f_row), ty), artist, font=f_soft, fill=soft)
+        draw_time(draw, (x + card_w - pad - time_width(probe, item.time, f_row), ty), item.time, f_row, faint)
+        ty += px["row_height"]
+    if more:
+        draw.text((tx + px["dot"] + dot_gap, ty), more, font=f_soft, fill=faint)
+
+    if card.opacity < 1:
+        alpha = layer.getchannel("A").point(lambda a: round(a * max(card.opacity, 0.0)))
+        layer.putalpha(alpha)
+    return layer
 
 
 BLANK = Image.new("RGBA", (2, 2), (0, 0, 0, 0))
 
 
-def compose(card: Card | None, line: tuple[float, float] | None, settings: dict,
-            size: tuple[int, int]) -> Image.Image:
-    """The whole overlay frame: the progress line (fill, opacity) under the card."""
-    if card is None and line is None:
-        return BLANK
-    layer = render_line(line[0], line[1], settings, size) if line else None
+def compose(card: Card | None, line: Line | None, settings: dict, size: tuple[int, int],
+            queue: QueueCard | None = None) -> Image.Image:
+    """The whole overlay frame: the progress line, then the queue card, then the song card."""
+    layers = []
+    if line is not None:
+        layers.append(render_line(line, settings, size))
+    if queue is not None and queue.items and queue.opacity > 0:
+        layers.append(render_queue(queue, settings, size))
     if card is not None:
-        drawn = render(card, settings, size)
-        layer = drawn if layer is None else Image.alpha_composite(layer, drawn)
-    return layer
+        layers.append(render(card, settings, size))
+    if not layers:
+        return BLANK
+    image = layers[0]
+    for layer in layers[1:]:
+        image = Image.alpha_composite(image, layer)
+    return image
 
 
 def write(image: Image.Image, target: Path) -> None:

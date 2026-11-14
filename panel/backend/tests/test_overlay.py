@@ -1,7 +1,9 @@
 from pathlib import Path
 
-from app.engine import OVERLAY_DEFAULTS, card_phase, clock, line_opacity
-from app.overlay import BLANK, Card, compose, render
+from app.engine import OVERLAY_DEFAULTS, card_phase, clock, line_opacity, queue_opacity
+from app.overlay import (
+    BLANK, SEGMENT_COLORS, Card, Line, QueueCard, QueueItem, compose, line_edges, render, render_queue,
+)
 
 S = OVERLAY_DEFAULTS  # start 15 s, end 20 s
 
@@ -89,9 +91,49 @@ def test_line_without_card_and_off():
 
 
 def test_compose_draws_full_width_line_at_the_bottom():
-    image = compose(None, (0.25, 1.0), S, (1280, 720))
+    image = compose(None, Line((200.0,), 50.0, 1.0), S, (1280, 720))
     box = image.getchannel("A").getbbox()
     assert box == (0, 716, 1280, 720)
     assert image.getpixel((100, 718))[:3] == (0xFF, 0x5C, 0x7A)  # filled: accent
-    assert image.getpixel((1000, 718))[3] < 60  # rest: faint track
+    assert image.getpixel((1000, 718))[3] < 140  # rest: faint track
     assert compose(None, None, S, (1280, 720)) is BLANK
+
+
+def test_line_has_a_segment_per_queued_song():
+    # On air 200 s (half played), then queued songs of 100 s and 100 s.
+    image = compose(None, Line((200.0, 100.0, 100.0), 100.0, 1.0), S, (1280, 720))
+    edges = line_edges((200.0, 100.0, 100.0), 1280)
+    assert [x0 for x0, _ in edges] == [0, 640, 960] and edges[-1][1] == 1280
+    assert edges[0][1] < 640  # a gap between segments
+    assert image.getpixel((100, 718)) == (0xFF, 0x5C, 0x7A, 255)  # played part of the song on air
+    assert image.getpixel((500, 718))[:3] == (0xFF, 0x5C, 0x7A)  # rest of it: faint accent
+    assert image.getpixel((500, 718))[3] < 140
+    second = image.getpixel((800, 718))
+    third = image.getpixel((1100, 718))
+    assert "#%02x%02x%02x" % second[:3] == SEGMENT_COLORS[0] and second[3] < 140
+    assert "#%02x%02x%02x" % third[:3] == SEGMENT_COLORS[1]
+    assert image.getpixel((edges[0][1], 718))[3] == 0  # gap
+
+
+def test_one_song_is_one_unbroken_line():
+    assert line_edges((180.0,), 1280) == [(0, 1280)]
+
+
+def test_queue_card_brightens_then_dims():
+    q = {**S, "queue_bright_seconds": 8, "queue_dim_opacity": 0.4}
+    assert queue_opacity(0, True, q) == 0  # new card fades in from nothing
+    assert queue_opacity(0, False, q) == 0.4  # existing card brightens from dimmed
+    assert queue_opacity(0.25, True, q) == 0.5
+    assert queue_opacity(4, True, q) == 1
+    assert 0.4 < queue_opacity(8.5, True, q) < 1
+    assert queue_opacity(30, True, q) == 0.4
+
+
+def test_queue_card_sits_opposite_the_song_card():
+    queue = QueueCard([QueueItem("Song", "Artist", "3:00", SEGMENT_COLORS[0])], 2)
+    box = render_queue(queue, S, (1280, 720)).getchannel("A").getbbox()  # song card bottom-left
+    assert box[2] > 1180 and box[1] < 100  # queue top-right
+    box = render_queue(queue, {**S, "position": "top-right"}, (1280, 720)).getchannel("A").getbbox()
+    assert box[0] < 100 and box[3] > 600  # queue bottom-left
+    dim = render_queue(QueueCard(queue.items, 0, 0.4), S, (1280, 720)).getchannel("A")
+    assert dim.getextrema()[1] <= 103

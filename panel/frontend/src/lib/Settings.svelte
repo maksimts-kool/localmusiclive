@@ -29,6 +29,7 @@
   const numeric = [
     'margin', 'scale', 'start_seconds', 'end_seconds', 'radius',
     'stroke_width', 'stroke_opacity', 'background_opacity', 'line_height',
+    'queue_rows', 'queue_bright_seconds', 'queue_dim_opacity',
   ];
 
   function numbers(values) {
@@ -127,7 +128,9 @@
     <h3 class="section-title">Song card on the stream</h3>
     <p class="muted hint">
       Shows the song as it starts and the next one before it ends, with a live countdown. In
-      between, a thin progress line runs along the bottom edge.
+      between, a thin progress line runs along the bottom edge, split into one coloured segment per
+      queued song. A small queue card in the opposite corner lists what's queued, bright when the
+      song or the queue changes, then dimmed.
     </p>
 
     {#if !(ov.enabled && ov.mode === 'always')}
@@ -162,7 +165,7 @@
       </div>
     {/if}
     <div class="preview" style:aspect-ratio="{resolution[0]} / {resolution[1]}">
-      {#if (ov.enabled || shown === 'line') && previewUrl}<img src={previewUrl} alt="Preview of the song card" />{/if}
+      {#if (ov.enabled || shown === 'line' || ov.queue_card) && previewUrl}<img src={previewUrl} alt="Preview of the song card" />{/if}
     </div>
 
     <div class="group">
@@ -172,6 +175,9 @@
       </label>
       <label class="check">
         <input type="checkbox" bind:checked={ov.progress_line} /> Progress line between the cards
+      </label>
+      <label class="check">
+        <input type="checkbox" bind:checked={ov.queue_card} /> Queue card
       </label>
     </div>
     <div class="grid">
@@ -249,6 +255,22 @@
       <label>
         <span>Progress line thickness ({ov.line_height} px)</span>
         <input type="range" min="1" max="12" step="1" bind:value={ov.line_height} disabled={!ov.progress_line} />
+      </label>
+    </div>
+
+    <h4 class="sub-title">Queue card</h4>
+    <div class="grid">
+      <label>
+        <span>Songs listed ({ov.queue_rows})</span>
+        <input type="range" min="1" max="8" step="1" bind:value={ov.queue_rows} disabled={!ov.queue_card} />
+      </label>
+      <label>
+        <span>Bright after a change (s)</span>
+        <input type="number" min="0" max="600" bind:value={ov.queue_bright_seconds} disabled={!ov.queue_card} />
+      </label>
+      <label>
+        <span>Dimmed opacity ({Math.round(ov.queue_dim_opacity * 100)} %)</span>
+        <input type="range" min="0" max="1" step="0.05" bind:value={ov.queue_dim_opacity} disabled={!ov.queue_card} />
       </label>
     </div>
     <div class="row-end"><button class="btn primary" onclick={saveOverlay}>Apply on stream</button></div>

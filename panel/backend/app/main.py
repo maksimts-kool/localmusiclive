@@ -276,6 +276,10 @@ class OverlaySettings(BaseModel):
     show_progress: bool | None = None
     progress_line: bool | None = None
     line_height: int | None = Field(None, ge=1, le=20)
+    queue_card: bool | None = None
+    queue_rows: int | None = Field(None, ge=1, le=8)
+    queue_bright_seconds: int | None = Field(None, ge=0, le=600)
+    queue_dim_opacity: float | None = Field(None, ge=0, le=1)
 
 
 class OverlayPreview(OverlaySettings):

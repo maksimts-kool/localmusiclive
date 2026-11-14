@@ -84,6 +84,13 @@ OVERLAY_DEFAULTS = {
     # Full-width song progress line along the bottom edge while no card shows.
     "progress_line": True,
     "line_height": 4,
+    # Small card listing the queued songs, in the colours of their segments on
+    # the progress line. Bright for a while after a new song starts or the
+    # queue changes, then dimmed.
+    "queue_card": True,
+    "queue_rows": 3,
+    "queue_bright_seconds": 8,
+    "queue_dim_opacity": 0.4,
 }
 OVERLAY_POSITIONS = (
     "bottom-left", "bottom-center", "bottom-right", "top-left", "top-center", "top-right",
@@ -93,6 +100,10 @@ CARD_FADE = 0.5
 CARD_END_GAP = 0.2
 # The progress line moves at most this often (seconds), to spare the encoder.
 LINE_STEP = 0.25
+# The progress line shows the song on air and at most this many queued songs.
+LINE_MAX_QUEUED = 9
+# The queue card dims over this long once its bright time is up.
+QUEUE_DIM_FADE = 1.5
 # Where the panel puts the card for ffplayout, relative to the media folder.
 CARD_FILE = ".overlay/card.png"
 
@@ -181,6 +192,22 @@ def line_opacity(position: float, until_next: float | None, length: float, setti
     return max(0.0, min(opacity, 1.0))
 
 
+def queue_opacity(age: float, appeared: bool, settings: dict) -> float:
+    """How visible the queue card is `age` seconds after the song or the queue
+    last changed. It fades in (from nothing if it just `appeared`, else from
+    dimmed), stays bright for queue_bright_seconds, then dims."""
+    dim = max(0.0, min(settings["queue_dim_opacity"], 1.0))
+    start = 0.0 if appeared else dim
+    bright = settings["queue_bright_seconds"]
+    if age < CARD_FADE:
+        level = start + (1 - start) * max(age, 0.0) / CARD_FADE
+    elif age < bright:
+        level = 1.0
+    else:
+        level = 1 - (1 - dim) * min((age - bright) / QUEUE_DIM_FADE, 1.0)
+    return round(max(0.0, min(level, 1.0)), 2)
+
+
 def clock(seconds: float) -> str:
     seconds = max(0, int(seconds + 0.999))
     return f"{seconds // 60}:{seconds % 60:02d}"
@@ -252,6 +279,10 @@ class Engine:
         self._interrupted: tuple[str, int, int, float] | None = None
         self._skip_pending = False
         self._card_key: tuple | None = None
+        # What the queue card last showed, since when, and whether it was new then.
+        self._queue_sig: tuple | None = None
+        self._queue_since = 0.0
+        self._queue_appeared = False
         self._text_cleared = False
         self._tasks: list[asyncio.Task] = []
         self.downloads: Any = None  # YouTube downloader, set by main
@@ -805,11 +836,38 @@ class Engine:
             opacity=round(opacity, 2),
         )
 
-    def _current_overlay(self, settings: dict) -> tuple[overlay.Card | None, tuple[float, float] | None]:
-        """The card and the progress line (fill, opacity) to show right now."""
+    def _queued_slots(self) -> list[Slot]:
+        """The queued songs that follow the one on air, in play order."""
+        slots = []
+        for slot in self._following():
+            if slot.kind == "gap" or slot.part != 0:
+                continue
+            if slot.kind != "queue":
+                break  # the queue always plays first, then autoplay
+            slots.append(slot)
+        return slots
+
+    def _queue_card(self, slots: list[Slot], settings: dict, opacity: float) -> overlay.QueueCard:
+        rows = max(1, int(settings["queue_rows"]))
+        items = []
+        for i, slot in enumerate(slots[:rows]):
+            track = self._track(slot.track_id)
+            items.append(overlay.QueueItem(
+                title=track["title"] if track else slot.title,
+                artist=track["artist"] if track else "",
+                time=clock((slot.full_out or slot.out) - slot.seek),
+                color=overlay.segment_color(i + 1, settings),
+            ))
+        return overlay.QueueCard(items, max(0, len(slots) - rows), opacity)
+
+    def _current_overlay(
+        self, settings: dict
+    ) -> tuple[overlay.Card | None, overlay.Line | None, overlay.QueueCard | None]:
+        """The song card, the progress line and the queue card to show right now."""
         cur = self.current
         if not self.status.running or cur is None or not cur.managed:
-            return None, None
+            self._queue_sig = None
+            return None, None, None
         position = cur.slot.seek + self._elapsed(cur)
         # The next song starts where this one ends, which for a clip split at
         # midnight is the end of tomorrow's part.
@@ -820,26 +878,59 @@ class Engine:
         card = None if phase is None else self._card_for(
             phase[0], phase[1], position, until_next, length, cur.slot, nxt
         )
+        queued = self._queued_slots()
+
         opacity = line_opacity(position, until_next, length, settings)
-        line = ((position - position % LINE_STEP) / length, opacity) if opacity > 0 else None
-        return card, line
+        line = None
+        if opacity > 0 and length > 0:
+            lengths = (length,) + tuple(
+                (s.full_out or s.out) - s.seek for s in queued[:LINE_MAX_QUEUED]
+            )
+            line = overlay.Line(lengths, position - position % LINE_STEP, opacity)
+
+        queue = None
+        if settings["queue_card"] and queued:
+            sig = (cur.date, cur.index, tuple(s.queue_id for s in queued))
+            now = time.monotonic()
+            if sig != self._queue_sig:
+                self._queue_appeared = self._queue_sig is None
+                self._queue_sig, self._queue_since = sig, now
+            queue = self._queue_card(
+                queued, settings, queue_opacity(now - self._queue_since, self._queue_appeared, settings)
+            )
+        else:
+            self._queue_sig = None
+        return card, line, queue
 
     def preview_card(self, settings: dict, phase: str) -> bytes:
-        """The card (or, for "line", the progress line) as it would look now,
-        for the settings dialog."""
+        """The overlay as it would look now, for the settings dialog: the song
+        card ("now"/"next") or, for "line", the progress line, with the queue
+        card bright beside the song card and dimmed beside the line."""
         settings = {**OVERLAY_DEFAULTS, **settings}
         size = (self.s.stream_width, self.s.stream_height)
+        cur = self.current
+        managed = cur is not None and cur.managed
+        queued = self._queued_slots() if managed else []
+        if not queued:
+            queued = [
+                Slot(kind="queue", path="", seek=0, out=180, duration=180, title="Requested song"),
+                Slot(kind="queue", path="", seek=0, out=245, duration=245, title="Another one"),
+            ]
+        queue = None
+        if settings["queue_card"]:
+            dim = settings["queue_dim_opacity"] if phase == "line" else 1.0
+            queue = self._queue_card(queued, settings, dim)
         if phase == "line":
-            image = overlay.compose(None, (64.0 / 212.0, 1.0), settings, size)
+            lengths = (212.0,) + tuple((s.full_out or s.out) - s.seek for s in queued[:LINE_MAX_QUEUED])
+            image = overlay.compose(None, overlay.Line(lengths, 64.0, 1.0), settings, size, queue)
         else:
-            cur = self.current
-            now_slot = cur.slot if cur is not None and cur.managed else None
+            now_slot = cur.slot if managed else None
             nxt = self._next_slot()
             sample = Slot(kind="auto", path="", seek=0, out=212, duration=212, title="Artist – Song title")
             card = self._card_for(
                 phase, 1.0, 64.0, 148.0, 212.0, now_slot or sample, nxt or now_slot or sample
-            )
-            image = overlay.render(card, settings, size)
+            ) if settings["enabled"] else None
+            image = overlay.compose(card, None, settings, size, queue)
         buffer = io.BytesIO()
         image.save(buffer, format="PNG", compress_level=1)
         return buffer.getvalue()
@@ -867,20 +958,27 @@ class Engine:
 
         settings = self.overlay_settings()
         size = (self.s.stream_width, self.s.stream_height)
-        card, line = self._current_overlay(settings)
+        card, line, queue = self._current_overlay(settings)
         key = (
             None if card is None else (
                 card.heading, card.title, card.artist, card.status, card.time, card.opacity,
                 round(card.progress or 0, 3), str(card.thumb),
             ),
-            None if line is None else (overlay.line_pixels(line[0], size), round(line[1], 2)),
+            None if line is None else (
+                overlay.line_pixels(line, size), round(line.opacity, 2),
+                tuple(round(n, 1) for n in line.lengths),
+            ),
+            None if queue is None else (
+                queue.opacity, queue.more,
+                tuple((i.title, i.artist, i.time, i.color) for i in queue.items),
+            ),
             json.dumps(settings, sort_keys=True),
         )
         if key == self._card_key:
             return
         self._card_key = key
         target = self.s.media_root / CARD_FILE
-        image = await asyncio.to_thread(overlay.compose, card, line, settings, size)
+        image = await asyncio.to_thread(overlay.compose, card, line, settings, size, queue)
         await asyncio.to_thread(overlay.write, image, target)
 
     async def _overlay_loop(self) -> None:
