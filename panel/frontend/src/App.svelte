@@ -6,6 +6,7 @@
   import History from './lib/History.svelte';
   import Settings from './lib/Settings.svelte';
   import YouTube from './lib/YouTube.svelte';
+  import Downloads from './lib/Downloads.svelte';
   import { api } from './lib/api.js';
   import { attempt, toasts } from './lib/toast.svelte.js';
 
@@ -16,6 +17,7 @@
   let tab = $state('queue');
   let source = $state('library');
   let settingsOpen = $state(false);
+  let headerHeight = $state(56);
 
   $effect(() => {
     let socket;
@@ -83,6 +85,7 @@
   }
 </script>
 
+<div class="sticky" bind:clientHeight={headerHeight}>
 <header class="top">
   <div class="brand">
     <span class="logo"></span>
@@ -110,6 +113,8 @@
     </button>
   </div>
 </header>
+{#if downloads.length}<Downloads {downloads} />{/if}
+</div>
 
 {#if status?.error && status.ffplayout !== 'ok'}
   <div class="banner warn">Can't reach ffplayout: {status.error}</div>
@@ -118,7 +123,7 @@
   <div class="banner warn">{warning}</div>
 {/each}
 
-<main>
+<main style:--header-height="{headerHeight}px">
   <div class="left">
     <NowPlaying now={data?.now} next={data?.next} {receivedAt} {running} onSkip={skip} />
 
@@ -173,16 +178,19 @@
 </div>
 
 <style>
-  .top {
+  .sticky {
     position: sticky;
     top: 0;
     z-index: 5;
+    background: color-mix(in srgb, var(--bg) 88%, transparent);
+    backdrop-filter: blur(8px);
+  }
+
+  .top {
     display: flex;
     align-items: center;
     gap: 16px;
     padding: 10px 20px;
-    background: color-mix(in srgb, var(--bg) 88%, transparent);
-    backdrop-filter: blur(8px);
     border-bottom: 1px solid var(--border);
   }
 
@@ -304,8 +312,8 @@
 
   .right {
     position: sticky;
-    top: 68px;
-    max-height: calc(100vh - 84px);
+    top: calc(var(--header-height) + 12px);
+    max-height: calc(100vh - var(--header-height) - 28px);
     overflow: auto;
   }
 

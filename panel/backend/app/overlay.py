@@ -5,7 +5,9 @@ live-logo.patch) shows it as its logo and reloads it whenever the file changes,
 so the panel can fade it in and out and tick the countdown every second.
 """
 
+import contextlib
 import os
+import tempfile
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -419,6 +421,14 @@ def compose(card: Card | None, line: Line | None, settings: dict, size: tuple[in
 def write(image: Image.Image, target: Path) -> None:
     """Replace the card atomically, so ffplayout never reads half a file."""
     target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_name(f".{target.name}.tmp")
-    image.save(tmp, format="PNG", compress_level=1)
-    os.replace(tmp, target)
+    # A temp file of its own, so two writes at once can't rename each other's.
+    fd, name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            image.save(f, format="PNG", compress_level=1)
+        os.chmod(name, 0o644)
+        os.replace(name, target)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(name)
+        raise

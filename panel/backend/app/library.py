@@ -12,6 +12,7 @@ from typing import Any
 
 from .db import DB
 from .settings import Settings
+from .categories import split_genres
 
 log = logging.getLogger("panel.library")
 
@@ -91,6 +92,7 @@ def describe(rel_path: str, probe: dict) -> dict | None:
         "artist": artist,
         "title": title,
         "album": _tag(tags, "album"),
+        "genres": split_genres(_tag(tags, "genre")),
         "duration": round(duration, 3),
         "width": video.get("width"),
         "height": video.get("height"),
@@ -159,10 +161,10 @@ class Library:
         if row is None:
             cur = self.db.run(
                 "INSERT INTO tracks (path, folder, artist, title, album, duration, width, height,"
-                " size, mtime, added_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " size, mtime, added_at, categories) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 path, "" if folder == "." else folder, info["artist"], info["title"],
                 info["album"], info["duration"], info["width"], info["height"],
-                size, mtime, time.time(),
+                size, mtime, time.time(), json.dumps(info["genres"], ensure_ascii=False),
             )
             track_id = cur.lastrowid
             result.added += 1

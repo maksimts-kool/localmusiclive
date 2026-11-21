@@ -9,13 +9,16 @@ queued or set to play next.
 import asyncio
 import json
 import logging
+import random
 import re
 import sys
 import time
+from collections import deque
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
+from . import discover
 from .db import DB
 from .library import Library
 from .settings import Settings
@@ -35,6 +38,22 @@ SEPARATORS = (" - ", " – ", " — ", " -- ", " | ", " : ")
 QUOTES = "\"'“”‘’«»"
 SEARCH_RESULTS = 15
 PARALLEL_DOWNLOADS = 2
+# A finished download leaves the list after this long (failed ones stay).
+AUTO_DISMISS_SECONDS = 5.0
+# New-song suggestions: built from this many most-played songs and artists,
+# kept this long unless refreshed.
+SUGGEST_SEEDS = 6
+SUGGEST_ARTISTS = 3
+# ...drawn at random (weighted by plays) from this many top songs and artists,
+# so each refresh starts from a different mix of favourites.
+SUGGEST_SEED_POOL = 20
+SUGGEST_ARTIST_POOL = 8
+SUGGEST_LIMIT = 20
+# Songs shown in this many previous lists are left out of a refresh.
+SUGGEST_REMEMBER = 3
+SUGGEST_MIX_LENGTH = 25
+SUGGEST_TTL = 6 * 3600
+PATH_ID = re.compile(r"\[([A-Za-z0-9_-]{11})\]\.[^./]+$")
 
 
 def video_id_from(text: str) -> str | None:
@@ -112,6 +131,10 @@ class YouTube:
         self._next_id = 1
         self._slots = asyncio.Semaphore(PARALLEL_DOWNLOADS)
         self._last_push = 0.0
+        self._suggest_cache: tuple[int, float, dict] | None = None
+        self._suggest_lock = asyncio.Lock()
+        self._recently_shown: deque[set[str]] = deque(maxlen=SUGGEST_REMEMBER)
+        self._timers: set[asyncio.Task] = set()
 
     # --- yt-dlp ----------------------------------------------------------------
 
@@ -195,6 +218,122 @@ class YouTube:
             })
         return results
 
+    # --- suggestions -----------------------------------------------------------
+
+    async def _entries(self, target: str, *extra: str) -> list[dict]:
+        code, out, err = await self._run("-J", "--flat-playlist", *extra, target, timeout=60)
+        if code != 0:
+            log.info("Suggestions: yt-dlp failed for %s: %s", target, self._error(err))
+            return []
+        try:
+            return [e for e in json.loads(out).get("entries") or [] if e]
+        except ValueError:
+            return []
+
+    def _seeds(self) -> list:
+        rows = self.db.all(
+            "SELECT * FROM tracks WHERE missing = 0 AND play_count > 0"
+            " ORDER BY play_count DESC, last_played_at DESC LIMIT ?", SUGGEST_SEED_POOL,
+        )
+        rows = discover.weighted_sample(rows, [r["play_count"] for r in rows], SUGGEST_SEEDS)
+        if len(rows) < SUGGEST_SEEDS:
+            # Little history yet: fill up with random newer songs.
+            taken = [r["id"] for r in rows] or [0]
+            newer = self.db.all(
+                f"SELECT * FROM tracks WHERE missing = 0 AND id NOT IN ({','.join('?' * len(taken))})"
+                " ORDER BY added_at DESC LIMIT ?", *taken, SUGGEST_SEED_POOL,
+            )
+            rows += random.sample(newer, min(len(newer), SUGGEST_SEEDS - len(rows)))
+        return sorted(rows, key=lambda r: -r["play_count"])
+
+    def _artists(self) -> list:
+        rows = self.db.all(
+            "SELECT artist, SUM(play_count) AS plays FROM tracks"
+            " WHERE missing = 0 AND artist != '' GROUP BY artist COLLATE NOCASE"
+            " HAVING plays > 0 ORDER BY plays DESC LIMIT ?", SUGGEST_ARTIST_POOL,
+        )
+        return discover.weighted_sample(rows, [r["plays"] for r in rows], SUGGEST_ARTISTS)
+
+    async def suggestions(self, refresh: bool = False) -> dict:
+        """New songs to download, from the most-played songs in the library.
+
+        Kept until songs are added or deleted, or until refreshed;
+        a refresh starts from other favourites and skips recently shown songs.
+        """
+        async with self._suggest_lock:
+            # A new or deleted song makes a new list; plays alone don't.
+            key = self.db.one("SELECT COUNT(*) AS n FROM tracks WHERE missing = 0")["n"]
+            cached = self._suggest_cache
+            if not refresh and cached and cached[0] == key and time.time() - cached[1] < SUGGEST_TTL:
+                return self._fresh(cached[2])
+            seeds = self._seeds()
+            artists = self._artists()
+
+            sem = asyncio.Semaphore(3)
+
+            async def mix(row) -> discover.Source:
+                async with sem:
+                    match = PATH_ID.search(row["path"])
+                    vid = match.group(1) if match else None
+                    if vid is None:
+                        name = f"{row['artist']} - {row['title']}" if row["artist"] else row["title"]
+                        found = await self._entries(f"ytsearch1:{name}")
+                        vid = found[0].get("id") if found else None
+                    entries = []
+                    if vid and VIDEO_ID.match(vid):
+                        entries = await self._entries(
+                            f"https://www.youtube.com/watch?v={vid}&list=RD{vid}",
+                            "--playlist-end", str(SUGGEST_MIX_LENGTH),
+                        )
+                    return discover.Source("mix", row["title"], row["play_count"], entries)
+
+            async def by_artist(row) -> discover.Source:
+                async with sem:
+                    entries = await self._entries(f"ytsearch12:{row['artist']} music video")
+                    return discover.Source("artist", row["artist"], row["plays"], entries)
+
+            sources = await asyncio.gather(*(mix(r) for r in seeds), *(by_artist(r) for r in artists))
+
+            tracks = self.db.all("SELECT artist, title, path FROM tracks")
+            have_ids = {m.group(1) for t in tracks if (m := PATH_ID.search(t["path"]))}
+            have_keys = {discover.song_key(t["artist"], t["title"]) for t in tracks}
+            artist_songs: dict[str, int] = {}
+            for t in tracks:
+                if t["artist"]:
+                    artist_songs[t["artist"].casefold()] = artist_songs.get(t["artist"].casefold(), 0) + 1
+
+            ranked = discover.rank(
+                sources, have_ids, have_keys, artist_songs, split_title, limit=SUGGEST_LIMIT * 4
+            )
+            ranked = discover.fresh_picks(ranked, set().union(*self._recently_shown), SUGGEST_LIMIT)
+            self._recently_shown.append({item["id"] for item in ranked})
+            result = {
+                "based_on": [
+                    {"id": r["id"], "title": r["title"], "artist": r["artist"], "plays": r["play_count"]}
+                    for r in seeds
+                ],
+                "items": [
+                    {
+                        "id": item["id"],
+                        "title": item.get("title") or item["id"],
+                        "channel": item.get("channel") or item.get("uploader") or "",
+                        "duration": item.get("duration"),
+                        "views": item.get("view_count"),
+                        "thumb": thumbnail(item["id"]),
+                        "reasons": item["reasons"],
+                    }
+                    for item in ranked
+                ],
+                "created_at": time.time(),
+            }
+            self._suggest_cache = (key, time.time(), result)
+            return self._fresh(result)
+
+    def _fresh(self, result: dict) -> dict:
+        """Drops suggestions downloaded since they were made."""
+        items = [i for i in result["items"] if not self.existing(i["id"])]
+        return {**result, "items": items}
+
     # --- downloads -------------------------------------------------------------
 
     def state(self) -> list[dict]:
@@ -206,7 +345,7 @@ class YouTube:
             self._last_push = now
             await self.engine.broadcast()
 
-    async def download(self, video_id: str, then: str) -> Job:
+    async def download(self, video_id: str, then: str, title: str | None = None) -> Job:
         if not VIDEO_ID.match(video_id):
             raise ValueError("That is not a YouTube video id")
         for job in self.jobs.values():
@@ -215,7 +354,8 @@ class YouTube:
                     job.then = then
                 return job
 
-        job = Job(self._next_id, video_id, title=video_id, then=then)
+        # The title shown until yt-dlp reports the real one.
+        job = Job(self._next_id, video_id, title=title or video_id, then=then)
         self._next_id += 1
         self.jobs[job.id] = job
         if track := self.existing(video_id):
@@ -233,6 +373,16 @@ class YouTube:
             await self.engine.queue_add(job.track_id, play_next=job.then == "next")
         job.status = "done"
         job.progress = 1.0
+        timer = asyncio.create_task(self._auto_dismiss(job.id))
+        self._timers.add(timer)
+        timer.add_done_callback(self._timers.discard)
+
+    async def _auto_dismiss(self, job_id: int) -> None:
+        await asyncio.sleep(AUTO_DISMISS_SECONDS)
+        job = self.jobs.get(job_id)
+        if job is not None and job.status == "done":
+            self.jobs.pop(job_id, None)
+            await self._push(force=True)
 
     async def _download(self, job: Job) -> None:
         url = f"https://www.youtube.com/watch?v={job.video_id}"

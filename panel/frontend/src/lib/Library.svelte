@@ -1,5 +1,6 @@
 <script>
   import Icon from './Icon.svelte';
+  import CategoryEditor from './CategoryEditor.svelte';
   import { api } from './api.js';
   import { attempt, toast } from './toast.svelte.js';
   import { duration } from './format.js';
@@ -9,9 +10,13 @@
   const PAGE = 60;
   let query = $state('');
   let folder = $state('');
+  let category = $state('');
+  let categories = $state([]);
+  // Track id whose categories are being edited, or 'bulk' for every match.
+  let editing = $state(null);
   let sort = $state('artist');
   let folders = $state([]);
-  let items = $state([]);
+  let items = $state.raw([]);
   let total = $state(0);
   let loading = $state(false);
   let sentinel;
@@ -23,6 +28,7 @@
     const params = new URLSearchParams({
       q: query,
       folder,
+      category,
       sort,
       limit: PAGE,
       offset: reset ? 0 : items.length,
@@ -41,7 +47,7 @@
 
   // Reload when the filters change (search is debounced) or the library is rescanned.
   $effect(() => {
-    const deps = [query, folder, sort, version];
+    const deps = [query, folder, category, sort, version];
     const timer = setTimeout(() => load(true), deps[0] ? 200 : 0);
     return () => clearTimeout(timer);
   });
@@ -49,7 +55,54 @@
   $effect(() => {
     version;
     api.get('/api/library/folders').then((f) => (folders = f)).catch(() => {});
+    loadCategories();
   });
+
+  function loadCategories() {
+    return api.get('/api/categories').then((c) => (categories = c)).catch(() => {});
+  }
+
+  let filtered = $derived(Boolean(query.trim() || folder || category));
+
+  // Saves run one after another, so quick clicks never send a stale list.
+  let saving = Promise.resolve();
+
+  function setCategories(id, categories) {
+    items = items.map((t) => (t.id === id ? { ...t, categories } : t));
+  }
+
+  function toggle(track, name) {
+    // Start from the latest list (the row may have changed since it was drawn).
+    const current = items.find((t) => t.id === track.id)?.categories ?? track.categories;
+    const key = name.toLowerCase();
+    const next = current.some((c) => c.toLowerCase() === key)
+      ? current.filter((c) => c.toLowerCase() !== key)
+      : [...current, name];
+    setCategories(track.id, next);
+    saving = saving.then(async () => {
+      try {
+        const saved = await api.put(`/api/tracks/${track.id}/categories`, { categories: next });
+        // Only take the server's spelling if nothing newer was picked meanwhile.
+        const now = items.find((t) => t.id === track.id)?.categories;
+        if (now === next) setCategories(track.id, saved.categories);
+        loadCategories();
+      } catch (error) {
+        toast(error.message, 'error');
+      }
+    });
+  }
+
+  async function bulk(change) {
+    const filter = { q: query, folder, category };
+    try {
+      const { changed } = await api.post('/api/categories/bulk', { ...filter, ...change });
+      const name = change.add ?? change.remove;
+      toast(changed ? `${change.add ? 'Added' : 'Removed'} “${name}” on ${changed} song${changed === 1 ? '' : 's'}` : 'Nothing to change');
+      if (change.remove) editing = null;
+    } catch (error) {
+      toast(error.message, 'error');
+    }
+  }
 
   $effect(() => {
     const observer = new IntersectionObserver((entries) => {
@@ -64,6 +117,21 @@
       () => api.post('/api/queue', { track_id: track.id, play_next: playNext }),
       playNext ? `Playing next: ${track.title}` : `Queued: ${track.title}`,
     );
+  }
+
+  async function remove(track) {
+    const name = track.artist ? `${track.artist} – ${track.title}` : track.title;
+    if (!confirm(`Delete “${name}”?\n\nThe video file is deleted from the media folder for good.`)) return;
+    try {
+      await api.del(`/api/tracks/${track.id}`);
+      items = items.filter((t) => t.id !== track.id);
+      total -= 1;
+      if (editing === track.id) editing = null;
+      toast(`Deleted ${name}`);
+      loadCategories();
+    } catch (error) {
+      toast(error.message, 'error');
+    }
   }
 
   function rescan() {
@@ -88,6 +156,11 @@
     <option value="">All folders</option>
     {#each folders as f}<option value={f}>{f}</option>{/each}
   </select>
+  <select bind:value={category} aria-label="Category">
+    <option value="">All categories</option>
+    {#each categories as c}<option value={c.name}>{c.name} ({c.count})</option>{/each}
+    <option value="__none__">No category</option>
+  </select>
   <select bind:value={sort} aria-label="Sort">
     <option value="artist">Artist</option>
     <option value="title">Title</option>
@@ -97,6 +170,29 @@
   </select>
 </div>
 
+{#if filtered && total}
+  <div class="bulk">
+    <span class="muted">{total} song{total === 1 ? '' : 's'} shown</span>
+    {#if category && category !== '__none__'}
+      <button class="btn small" onclick={() => confirm(`Remove “${category}” from ${total} songs?`) && bulk({ remove: category })}>
+        Remove “{category}”
+      </button>
+    {/if}
+    <button class="btn small" class:active={editing === 'bulk'} onclick={() => (editing = editing === 'bulk' ? null : 'bulk')}>
+      <Icon name="tag" size={14} /> Tag all
+    </button>
+  </div>
+  {#if editing === 'bulk'}
+    <CategoryEditor
+      all={categories}
+      selected={[]}
+      placeholder="Category to add to all {total}…"
+      onToggle={(name) => bulk({ add: name })}
+      onDone={() => (editing = null)}
+    />
+  {/if}
+{/if}
+
 <ul class="list">
   {#each items as track (track.id)}
     <li class="row" ondblclick={() => add(track, false)}>
@@ -104,20 +200,55 @@
         {#if !track.thumb}<Icon name="music" size={16} />{/if}
       </div>
       <div class="text">
-        <div class="ellipsis title" title={track.path}>{track.title}</div>
+        <div class="title-line">
+          <span class="ellipsis title" title={track.path}>{track.title}</span>
+          {#if track.play_count}
+            <span class="plays" title="Played {track.play_count} time{track.play_count === 1 ? '' : 's'} on the stream">
+              <Icon name="play" size={9} />{track.play_count}
+            </span>
+          {/if}
+        </div>
         <div class="ellipsis muted sub">
           {track.artist || track.folder || ' '}
         </div>
+        {#if track.categories?.length}
+          <div class="cats">
+            {#each track.categories as c}
+              <button class="cat" title="Show only {c}" onclick={() => (category = c)}>{c}</button>
+            {/each}
+          </div>
+        {/if}
       </div>
       {#if queuedIds.has(track.id)}<span class="badge queue">Queued</span>{/if}
       <span class="muted dur">{duration(track.duration)}</span>
+      <button
+        class="icon-btn"
+        class:active={editing === track.id}
+        title="Categories"
+        onclick={() => (editing = editing === track.id ? null : track.id)}
+      >
+        <Icon name="tag" size={16} />
+      </button>
       <button class="icon-btn" title="Play next" onclick={() => add(track, true)}>
         <Icon name="next" size={17} />
       </button>
       <button class="icon-btn add" title="Add to queue" onclick={() => add(track, false)}>
         <Icon name="plus" size={18} />
       </button>
+      <button class="icon-btn danger" title="Delete song" onclick={() => remove(track)}>
+        <Icon name="trash" size={16} />
+      </button>
     </li>
+    {#if editing === track.id}
+      <li>
+        <CategoryEditor
+          all={categories}
+          selected={track.categories}
+          onToggle={(name) => toggle(track, name)}
+          onDone={() => (editing = null)}
+        />
+      </li>
+    {/if}
   {/each}
 </ul>
 <div bind:this={sentinel} class="sentinel"></div>
@@ -212,6 +343,28 @@
     font-weight: 550;
   }
 
+  .title-line {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+  }
+
+  .plays {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    flex: none;
+    height: 17px;
+    padding: 0 6px;
+    border-radius: 99px;
+    background: color-mix(in srgb, var(--accent) 16%, transparent);
+    color: var(--accent);
+    font-size: 11px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+  }
+
   .sub {
     font-size: 12.5px;
   }
@@ -223,6 +376,61 @@
   }
 
   .add {
+    color: var(--accent);
+  }
+
+  .icon-btn.danger:hover:not(:disabled) {
+    color: var(--live);
+  }
+
+  .icon-btn.active {
+    background: var(--surface-3);
+    color: var(--accent);
+  }
+
+  .cats {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-top: 3px;
+  }
+
+  .cat {
+    height: 18px;
+    padding: 0 7px;
+    border: 0;
+    border-radius: 99px;
+    background: var(--surface-3);
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 600;
+  }
+
+  .cat:hover {
+    color: var(--accent);
+  }
+
+  .bulk {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 8px;
+    margin: -2px 0 8px;
+    font-size: 12.5px;
+  }
+
+  .bulk .muted {
+    margin-right: auto;
+  }
+
+  .btn.small {
+    height: 28px;
+    padding: 0 10px;
+    font-size: 12.5px;
+  }
+
+  .btn.active {
+    border-color: var(--accent);
     color: var(--accent);
   }
 

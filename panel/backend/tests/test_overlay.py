@@ -144,3 +144,18 @@ def test_queue_card_sits_opposite_the_song_card():
     assert box[0] < 100 and box[3] > 600  # queue bottom-left
     dim = render_queue(QueueCard(queue.items, 0, 0.4), S, (1280, 720)).getchannel("A")
     assert dim.getextrema()[1] <= 103
+
+
+def test_concurrent_writes_do_not_collide(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from PIL import Image
+
+    from app.overlay import write
+
+    target = tmp_path / "card.png"
+    image = Image.new("RGBA", (64, 36), (255, 0, 0, 128))
+    with ThreadPoolExecutor(8) as pool:
+        list(pool.map(lambda _: write(image, target), range(200)))
+    assert Image.open(target).size == (64, 36)
+    assert [p.name for p in tmp_path.iterdir()] == ["card.png"]

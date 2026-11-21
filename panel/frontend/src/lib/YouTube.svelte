@@ -11,6 +11,39 @@
   let searched = $state('');
   let searching = $state(false);
 
+  // New songs to download, picked from what plays most on the stream.
+  let suggested = $state(null);
+  let suggesting = $state(false);
+
+  async function suggest(refresh = false) {
+    suggesting = true;
+    try {
+      suggested = await api.get(`/api/youtube/suggestions${refresh ? '?refresh=true' : ''}`);
+    } catch (error) {
+      toast(error.message, 'error');
+    } finally {
+      suggesting = false;
+    }
+  }
+
+  $effect(() => {
+    suggest();
+  });
+
+  // Clearing the search box goes back to the suggestions.
+  $effect(() => {
+    if (!query.trim()) {
+      results = [];
+      searched = '';
+    }
+  });
+
+  let basedOn = $derived.by(() => {
+    const names = (suggested?.based_on ?? []).slice(0, 3).map((t) => t.title);
+    const more = (suggested?.based_on?.length ?? 0) - names.length;
+    return names.join(', ') + (more > 0 ? ` and ${more} more` : '');
+  });
+
   // Downloads by video id, to show progress on the matching result.
   let active = $derived(new Map(downloads.map((d) => [d.video_id, d])));
 
@@ -31,11 +64,7 @@
 
   function download(video, then) {
     const verb = { none: 'Downloading', queue: 'Downloading, then queueing', next: 'Downloading, then playing next' }[then];
-    attempt(() => api.post('/api/youtube/downloads', { video_id: video.id, then }), `${verb}: ${video.title}`);
-  }
-
-  function dismiss(job) {
-    attempt(() => api.del(`/api/youtube/downloads/${job.id}`));
+    attempt(() => api.post('/api/youtube/downloads', { video_id: video.id, then, title: video.title }), `${verb}: ${video.title}`);
   }
 
   function views(n) {
@@ -46,20 +75,6 @@
     return `${n} views`;
   }
 
-  const statusText = {
-    waiting: 'Waiting…',
-    downloading: 'Downloading',
-    adding: 'Adding to library…',
-    done: 'Added',
-    error: 'Failed',
-  };
-
-  function jobLine(job) {
-    if (job.status === 'downloading') return `Downloading ${Math.round(job.progress * 100)}%`;
-    if (job.status === 'done') return { queue: 'Added and queued', next: 'Added, plays next', none: 'Added to library' }[job.then];
-    if (job.status === 'error') return job.error;
-    return statusText[job.status];
-  }
 </script>
 
 <form class="searchbar" onsubmit={search}>
@@ -71,63 +86,72 @@
   <button class="btn primary" disabled={searching || !query.trim()}>{searching ? 'Searching…' : 'Search'}</button>
 </form>
 
-{#if downloads.length}
-  <div class="jobs">
-    {#each downloads as job (job.id)}
-      <div class="job" class:error={job.status === 'error'}>
-        <div class="thumb tiny" style:background-image="url({job.thumb})"></div>
-        <div class="text">
-          <div class="ellipsis title">{job.title}</div>
-          <div class="ellipsis sub" class:muted={job.status !== 'error'}>{jobLine(job)}</div>
-          {#if job.status === 'downloading' || job.status === 'waiting' || job.status === 'adding'}
-            <div class="bar"><div class="fill" style:width="{job.progress * 100}%"></div></div>
-          {/if}
-        </div>
-        <button
-          class="icon-btn"
-          title={job.status === 'done' || job.status === 'error' ? 'Dismiss' : 'Cancel download'}
-          onclick={() => dismiss(job)}
-        >
-          <Icon name="close" size={16} />
-        </button>
-      </div>
-    {/each}
-  </div>
-{/if}
-
-<ul class="list">
-  {#each results as video (video.id)}
-    {@const job = active.get(video.id)}
-    {@const busy = job && ['waiting', 'downloading', 'adding'].includes(job.status)}
-    <li class="row">
-      <a class="thumb yt" href="https://www.youtube.com/watch?v={video.id}" target="_blank" rel="noreferrer"
-        style:background-image="url({video.thumb})" title="Open on YouTube">
-        {#if video.duration}<span class="len">{duration(video.duration)}</span>{/if}
-      </a>
-      <div class="text">
-        <div class="title clamp" title={video.title}>{video.title}</div>
-        <div class="ellipsis muted sub">{video.channel}{video.views != null ? ` · ${views(video.views)}` : ''}</div>
+{#snippet item(video)}
+  {@const job = active.get(video.id)}
+  {@const busy = job && ['waiting', 'downloading', 'adding'].includes(job.status)}
+  <li class="row">
+    <a class="thumb yt" href="https://www.youtube.com/watch?v={video.id}" target="_blank" rel="noreferrer"
+      style:background-image="url({video.thumb})" title="Open on YouTube">
+      {#if video.duration}<span class="len">{duration(video.duration)}</span>{/if}
+    </a>
+    <div class="text">
+      <div class="title clamp" title={video.title}>{video.title}</div>
+      <div class="ellipsis muted sub">{video.channel}{video.views != null ? ` · ${views(video.views)}` : ''}</div>
+      {#if video.reasons?.length}
+        <div class="reason ellipsis">{video.reasons.join(' · ')}</div>
+      {/if}
+      <div class="labels">
         {#if video.track_id || job?.status === 'done'}<span class="badge queue">In library</span>{/if}
+        {#if busy}<span class="badge queue">{job.status === 'downloading' ? `${Math.round(job.progress * 100)}%` : 'Downloading'}</span>{/if}
       </div>
-      <div class="actions">
-        <button class="icon-btn" title="Download only" disabled={busy} onclick={() => download(video, 'none')}>
-          <Icon name="download" size={17} />
-        </button>
-        <button class="icon-btn" title="Download and play next" disabled={busy} onclick={() => download(video, 'next')}>
-          <Icon name="next" size={17} />
-        </button>
-        <button class="icon-btn add" title="Download and add to queue" disabled={busy} onclick={() => download(video, 'queue')}>
-          <Icon name="plus" size={18} />
-        </button>
-      </div>
-    </li>
-  {/each}
-</ul>
+    </div>
+    <div class="actions">
+      <button class="icon-btn" title="Download only" disabled={busy} onclick={() => download(video, 'none')}>
+        <Icon name="download" size={17} />
+      </button>
+      <button class="icon-btn" title="Download and play next" disabled={busy} onclick={() => download(video, 'next')}>
+        <Icon name="next" size={17} />
+      </button>
+      <button class="icon-btn add" title="Download and add to queue" disabled={busy} onclick={() => download(video, 'queue')}>
+        <Icon name="plus" size={18} />
+      </button>
+    </div>
+  </li>
+{/snippet}
 
-{#if searched && !searching && !results.length}
-  <div class="empty">No videos found for “{searched}”.</div>
-{:else if !searched && !downloads.length}
-  <div class="empty">
+{#if searched || searching}
+  <ul class="list">
+    {#each results as video (video.id)}{@render item(video)}{/each}
+  </ul>
+  {#if searched && !searching && !results.length}
+    <div class="empty">No videos found for “{searched}”.</div>
+  {/if}
+{:else}
+  <div class="head">
+    <div>
+      <h2 class="section-title"><Icon name="sparkles" size={13} /> Suggested for you</h2>
+      {#if basedOn}<div class="muted based">From your most played: {basedOn}</div>{/if}
+    </div>
+    <button class="icon-btn" title="New suggestions" onclick={() => suggest(true)} disabled={suggesting}>
+      <Icon name={suggesting ? 'loader' : 'refresh'} size={16} />
+    </button>
+  </div>
+  {#if suggested?.items.length}
+    <ul class="list">
+      {#each suggested.items as video (video.id)}{@render item(video)}{/each}
+    </ul>
+  {:else if suggesting}
+    <div class="empty">Looking at your most played songs on YouTube…</div>
+  {:else if suggested}
+    <div class="empty">
+      {#if suggested.based_on.length}
+        No new songs found. Try again later, or search below.
+      {:else}
+        Suggestions appear once your library has songs.
+      {/if}
+    </div>
+  {/if}
+  <div class="empty hint">
     Search YouTube for a music video, or paste a link. Downloads go to
     <code>media/youtube/</code> and join the library; <b>+</b> also queues the song.
   </div>
@@ -167,42 +191,44 @@
     color: var(--text);
   }
 
-  .jobs {
+  .head {
     display: flex;
-    flex-direction: column;
-    gap: 6px;
-    margin-bottom: 12px;
-    padding-bottom: 12px;
-    border-bottom: 1px solid var(--border);
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 8px;
+    margin: 2px 0 6px;
   }
 
-  .job {
+  .head .section-title {
     display: flex;
     align-items: center;
-    gap: 10px;
-    min-width: 0;
+    gap: 5px;
   }
 
-  .job.error .sub {
-    color: var(--live);
+  .based {
+    font-size: 12px;
+    margin-top: 2px;
   }
 
-  .thumb.tiny {
-    width: 56px;
+  .reason {
+    font-size: 12px;
+    color: var(--accent);
   }
 
-  .bar {
-    height: 4px;
+  .hint {
+    padding-top: 16px;
+    font-size: 12.5px;
+  }
+
+  .labels {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
     margin-top: 4px;
-    border-radius: 99px;
-    background: var(--surface-3);
-    overflow: hidden;
   }
 
-  .fill {
-    height: 100%;
-    background: var(--accent);
-    transition: width 0.4s ease;
+  .labels:empty {
+    display: none;
   }
 
   .list {

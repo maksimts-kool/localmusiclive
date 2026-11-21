@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 from contextlib import asynccontextmanager
 from typing import Literal
@@ -8,6 +9,7 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from .categories import categories_of, clean_categories
 from .db import DB
 from .engine import OVERLAY_POSITIONS, Engine, EngineError, track_json
 from .ffplayout import FFplayout, FFplayoutError
@@ -113,26 +115,39 @@ SORTS = {
 }
 
 
-@app.get("/api/library")
-def list_library(
-    q: str = "",
-    folder: str = "",
-    sort: Literal["artist", "title", "added", "played", "recent"] = "artist",
-    limit: int = Query(100, ge=1, le=500),
-    offset: int = Query(0, ge=0),
-) -> dict:
+UNCATEGORIZED = "__none__"
+
+
+def library_filter(q: str, folder: str, category: str) -> tuple[str, list]:
     where, args = ["missing = 0"], []
     for word in q.split():
         like = "%" + word.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
         where.append(
             "(artist LIKE ? ESCAPE '\\' OR title LIKE ? ESCAPE '\\'"
-            " OR album LIKE ? ESCAPE '\\' OR path LIKE ? ESCAPE '\\')"
+            " OR album LIKE ? ESCAPE '\\' OR path LIKE ? ESCAPE '\\' OR categories LIKE ? ESCAPE '\\')"
         )
-        args += [like] * 4
+        args += [like] * 5
     if folder := folder.strip("/"):
         where.append("(folder = ? OR folder LIKE ?)")
         args += [folder, folder + "/%"]
-    clause = " AND ".join(where)
+    if category == UNCATEGORIZED:
+        where.append("json_array_length(categories) = 0")
+    elif category:
+        where.append("EXISTS (SELECT 1 FROM json_each(tracks.categories) WHERE value = ? COLLATE NOCASE)")
+        args.append(category)
+    return " AND ".join(where), args
+
+
+@app.get("/api/library")
+def list_library(
+    q: str = "",
+    folder: str = "",
+    category: str = "",
+    sort: Literal["artist", "title", "added", "played", "recent"] = "artist",
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+) -> dict:
+    clause, args = library_filter(q, folder, category)
     total = db.one(f"SELECT COUNT(*) AS n FROM tracks WHERE {clause}", *args)["n"]
     rows = db.all(
         f"SELECT * FROM tracks WHERE {clause} ORDER BY {SORTS[sort]} LIMIT ? OFFSET ?",
@@ -150,12 +165,85 @@ def list_folders() -> list[str]:
     return sorted(folders, key=str.lower)
 
 
+def category_counts() -> dict[str, int]:
+    counts: dict[str, int] = {}
+    names: dict[str, str] = {}
+    for row in db.all("SELECT categories FROM tracks WHERE missing = 0 AND categories != '[]'"):
+        for name in categories_of(row):
+            key = name.casefold()
+            names.setdefault(key, name)
+            counts[key] = counts.get(key, 0) + 1
+    return {names[k]: n for k, n in counts.items()}
+
+
+@app.get("/api/categories")
+def list_categories() -> list[dict]:
+    counts = category_counts()
+    return [{"name": n, "count": counts[n]} for n in sorted(counts, key=str.casefold)]
+
+
+class TrackCategories(BaseModel):
+    categories: list[str] = Field(max_length=50)
+
+
+@app.put("/api/tracks/{track_id}/categories")
+async def put_track_categories(track_id: int, body: TrackCategories) -> dict:
+    row = db.one("SELECT * FROM tracks WHERE id = ?", track_id)
+    if row is None:
+        raise HTTPException(404, "That track is not in the library")
+    names = clean_categories(body.categories, category_counts())
+    db.run("UPDATE tracks SET categories = ? WHERE id = ?", json.dumps(names, ensure_ascii=False), track_id)
+    await engine.categories_changed(reload_library=False)
+    return {"categories": names}
+
+
+class BulkCategories(BaseModel):
+    """Add or remove one category on every song matching the library filter."""
+
+    q: str = ""
+    folder: str = ""
+    category: str = ""
+    add: str | None = None
+    remove: str | None = None
+
+
+@app.post("/api/categories/bulk")
+async def bulk_categories(body: BulkCategories) -> dict:
+    add = clean_categories([body.add or ""], category_counts())
+    remove = (body.remove or "").strip().casefold()
+    if not add and not remove:
+        raise HTTPException(422, "Name a category to add or remove")
+    clause, args = library_filter(body.q, body.folder, body.category)
+    changed = 0
+    with db.tx():
+        for row in db.all(f"SELECT id, categories FROM tracks WHERE {clause}", *args):
+            names = categories_of(row)
+            updated = [n for n in names if n.casefold() != remove] if remove else names
+            if add and all(n.casefold() != add[0].casefold() for n in updated):
+                updated = clean_categories(updated + add)
+            if updated != names:
+                db.run(
+                    "UPDATE tracks SET categories = ? WHERE id = ?",
+                    json.dumps(updated, ensure_ascii=False), row["id"],
+                )
+                changed += 1
+    if changed:
+        await engine.categories_changed()
+    return {"changed": changed}
+
+
 @app.post("/api/library/rescan", status_code=202)
 async def rescan() -> dict:
     if library.scanning:
         return {"started": False}
     asyncio.create_task(engine.rescan())
     return {"started": True}
+
+
+@app.delete("/api/tracks/{track_id}")
+async def delete_track(track_id: int) -> dict:
+    """Deletes the song's video file from the media folder."""
+    return {"removed": await run(engine.remove_track(track_id))}
 
 
 @app.get("/api/thumbs/{track_id}.jpg")
@@ -218,14 +306,20 @@ async def youtube_search(q: str = Query(..., min_length=1, max_length=200)) -> l
         raise HTTPException(502, f"YouTube search failed: {exc}") from exc
 
 
+@app.get("/api/youtube/suggestions")
+async def youtube_suggestions(refresh: bool = False) -> dict:
+    return await youtube.suggestions(refresh)
+
+
 class Download(BaseModel):
     video_id: str = Field(pattern=r"^[A-Za-z0-9_-]{11}$")
     then: Literal["none", "queue", "next"] = "queue"
+    title: str | None = Field(None, max_length=300)
 
 
 @app.post("/api/youtube/downloads", status_code=202)
 async def youtube_download(body: Download) -> dict:
-    job = await run(youtube.download(body.video_id, body.then))
+    job = await run(youtube.download(body.video_id, body.then, body.title))
     return job.public()
 
 
@@ -248,6 +342,7 @@ class AutoplaySettings(BaseModel):
     enabled: bool | None = None
     mode: Literal["shuffle", "least_played", "in_order"] | None = None
     folder: str | None = None
+    categories: list[str] | None = Field(None, max_length=50)
     avoid_repeat: int | None = Field(None, ge=0, le=500)
 
 

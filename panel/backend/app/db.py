@@ -21,7 +21,8 @@ CREATE TABLE IF NOT EXISTS tracks (
     missing INTEGER NOT NULL DEFAULT 0,
     added_at REAL NOT NULL,
     play_count INTEGER NOT NULL DEFAULT 0,
-    last_played_at REAL
+    last_played_at REAL,
+    categories TEXT NOT NULL DEFAULT '[]'  -- JSON list of names
 );
 
 CREATE TABLE IF NOT EXISTS queue (
@@ -79,6 +80,12 @@ class DB:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        columns = {row["name"] for row in self.all("PRAGMA table_info(tracks)")}
+        if "categories" not in columns:
+            self.run("ALTER TABLE tracks ADD COLUMN categories TEXT NOT NULL DEFAULT '[]'")
 
     def all(self, sql: str, *args: Any) -> list[sqlite3.Row]:
         return self.conn.execute(sql, args).fetchall()

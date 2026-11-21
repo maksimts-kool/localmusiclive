@@ -24,6 +24,7 @@ from datetime import date as Date, datetime, timedelta
 from typing import Any, Iterator
 from zoneinfo import ZoneInfo
 
+from .categories import categories_of
 from .db import DB
 from .ffplayout import FFplayout, FFplayoutError
 from .library import Library
@@ -56,6 +57,7 @@ AUTOPLAY_DEFAULTS = {
     "enabled": True,
     "mode": "shuffle",  # shuffle | least_played | in_order
     "folder": "",
+    "categories": [],  # any of these; empty means every song
     "avoid_repeat": 20,
 }
 
@@ -228,6 +230,7 @@ def track_json(row: Any) -> dict:
         "duration": row["duration"],
         "play_count": row["play_count"],
         "last_played_at": row["last_played_at"],
+        "categories": categories_of(row),
         "thumb": f"/api/thumbs/{row['id']}.jpg?v={int(row['mtime'])}" if row["has_thumb"] else None,
     }
 
@@ -279,6 +282,8 @@ class Engine:
         self._interrupted: tuple[str, int, int, float] | None = None
         self._skip_pending = False
         self._card_key: tuple | None = None
+        # Card updates come from the overlay loop and from commands; one at a time.
+        self._overlay_lock = asyncio.Lock()
         # What the queue card last showed, since when, and whether it was new then.
         self._queue_sig: tuple | None = None
         self._queue_since = 0.0
@@ -644,9 +649,11 @@ class Engine:
         tracks = {row["id"]: row for row in self.db.all("SELECT * FROM tracks WHERE missing = 0")}
         settings = self.autoplay_settings()
         folder = settings["folder"].strip("/")
+        wanted = {c.casefold() for c in settings.get("categories") or []}
         pool = [
             t for t in tracks.values()
-            if not folder or t["folder"] == folder or t["folder"].startswith(folder + "/")
+            if (not folder or t["folder"] == folder or t["folder"].startswith(folder + "/"))
+            and (not wanted or any(c.casefold() in wanted for c in categories_of(t)))
         ]
         return tracks, pool, settings
 
@@ -945,6 +952,10 @@ class Engine:
         return buffer.getvalue()
 
     async def _update_overlay(self) -> None:
+        async with self._overlay_lock:
+            await self._draw_overlay()
+
+    async def _draw_overlay(self) -> None:
         if not self.status.running:
             return
         if not self._text_cleared:
@@ -1045,6 +1056,39 @@ class Engine:
             await self._after_change()
         await self.broadcast()
 
+    async def remove_track(self, track_id: int) -> str:
+        """Deletes a song's video file and takes it out of the library.
+
+        The row stays (marked missing) so history keeps its name; a later scan
+        brings it back if the file reappears. Returns the song's name.
+        """
+        async with self.lock:
+            row = self.db.one("SELECT * FROM tracks WHERE id = ? AND missing = 0", track_id)
+            if row is None:
+                raise EngineError("That song is not in the library")
+            cur = self.current
+            if cur is not None and cur.slot is not None and cur.slot.track_id == track_id:
+                raise EngineError("This song is on air now. Skip it first, then remove it.")
+
+            root = self.s.media_root.resolve()
+            path = (root / row["path"]).resolve()
+            if not path.is_relative_to(root):
+                raise EngineError("That file is outside the media folder")
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                raise EngineError(f"Could not delete the file: {exc.strerror or exc}") from exc
+            self.library.thumb_path(track_id).unlink(missing_ok=True)
+
+            with self.db.tx():
+                self.db.run("UPDATE tracks SET missing = 1, has_thumb = 0 WHERE id = ?", track_id)
+                self.db.run("DELETE FROM queue WHERE track_id = ?", track_id)
+                self.db.run("DELETE FROM upcoming WHERE track_id = ?", track_id)
+            log.info("Deleted %s", row["path"])
+            await self._after_change()
+        await self.broadcast()
+        return f"{row['artist']} – {row['title']}" if row["artist"] else row["title"]
+
     async def skip(self) -> None:
         async with self.lock:
             cur = self.current
@@ -1066,6 +1110,20 @@ class Engine:
             # Re-pick with the new rules.
             self.db.run("DELETE FROM upcoming")
             await self._after_change()
+        await self.broadcast()
+
+    async def categories_changed(self, reload_library: bool = True) -> None:
+        """Song categories were edited: refresh libraries and autoplay picks.
+
+        One song's edit skips the library reload, which would scroll open
+        library lists back to the top; that client updates the row itself.
+        """
+        if reload_library:
+            await self.hub.broadcast({"type": "library"})
+        if self.autoplay_settings().get("categories"):
+            async with self.lock:
+                self.db.run("DELETE FROM upcoming")
+                await self._after_change()
         await self.broadcast()
 
     async def set_overlay(self, values: dict) -> None:
