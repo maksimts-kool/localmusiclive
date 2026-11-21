@@ -129,6 +129,13 @@ def test_queue_card_brightens_then_dims():
     assert queue_opacity(30, True, q) == 0.4
 
 
+def test_queue_card_lists_countdowns():
+    items = [QueueItem("Песня", "Исполнитель", "2:15", SEGMENT_COLORS[0]),
+             QueueItem("Ещё", "", "5:20", SEGMENT_COLORS[1])]
+    image = render_queue(QueueCard(items, 0, 0.4), S, (1280, 720))
+    assert image.getchannel("A").getbbox() is not None
+
+
 def test_queue_card_sits_opposite_the_song_card():
     queue = QueueCard([QueueItem("Song", "Artist", "3:00", SEGMENT_COLORS[0])], 2)
     box = render_queue(queue, S, (1280, 720)).getchannel("A").getbbox()  # song card bottom-left

@@ -129,7 +129,7 @@
     <p class="muted hint">
       Shows the song as it starts and the next one before it ends, with a live countdown. In
       between, a thin progress line runs along the bottom edge, split into one coloured segment per
-      queued song. A small queue card in the opposite corner lists what's queued, bright when the
+      queued song. A small queue card in the opposite corner lists what's queued with a countdown to each song, bright when the
       song or the queue changes, then dimmed.
     </p>
 

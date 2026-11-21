@@ -36,10 +36,10 @@ SLIDE = 14  # px the card rises while it fades in
 
 @dataclass
 class Card:
-    heading: str  # "NOW PLAYING" / "UP NEXT"
+    heading: str  # "Сейчас играет" / "Далее"
     title: str
     artist: str
-    status: str  # e.g. "Next song in {time}"; {time} is drawn with even-width digits
+    status: str  # e.g. "Следующая песня через {time}"; {time} is drawn with even-width digits
     time: str  # "3:42"
     progress: float | None  # 0..1, or None for no bar
     thumb: Path | None
@@ -291,7 +291,7 @@ QUEUE_BASE = {
 class QueueItem:
     title: str
     artist: str
-    time: str  # its length, "3:42"
+    time: str  # countdown to when it starts, "3:42"
     color: str
 
 
@@ -322,9 +322,11 @@ def render_queue(card: QueueCard, settings: dict, size: tuple[int, int]) -> Imag
     dot_gap = round(8 * k)
     col_gap = round(14 * k)
 
-    heading = spaced("QUEUE")
+    heading = spaced("ОЧЕРЕДЬ")
     count = str(len(card.items) + card.more)
-    times_w = max((time_width(probe, item.time, f_row) for item in card.items), default=0)
+    prefix = "через "
+    prefix_w = probe.textlength(prefix, font=f_soft)
+    times_w = prefix_w + max((time_width(probe, item.time, f_row) for item in card.items), default=0)
     max_label = round(frame_w * 0.3) - 2 * pad - px["dot"] - dot_gap - col_gap - times_w
 
     rows = []
@@ -335,7 +337,7 @@ def render_queue(card: QueueCard, settings: dict, size: tuple[int, int]) -> Imag
         if item.artist and rest > probe.textlength("  ·  …", font=f_soft) + 20 * k:
             artist = fit(probe, "  ·  " + item.artist, f_soft, rest)
         rows.append((item, title, artist))
-    more = f"+{card.more} more" if card.more else ""
+    more = f"и ещё {card.more}" if card.more else ""
 
     label_w = max(
         (probe.textlength(t, font=f_row) + (probe.textlength(a, font=f_soft) if a else 0) for _, t, a in rows),
@@ -379,7 +381,10 @@ def render_queue(card: QueueCard, settings: dict, size: tuple[int, int]) -> Imag
         draw.text((lx, ty), title, font=f_row, fill=white)
         if artist:
             draw.text((lx + probe.textlength(title, font=f_row), ty), artist, font=f_soft, fill=soft)
-        draw_time(draw, (x + card_w - pad - time_width(probe, item.time, f_row), ty), item.time, f_row, faint)
+        # Countdown to the song, right-aligned: "через 2:15".
+        time_x = x + card_w - pad - time_width(probe, item.time, f_row)
+        draw.text((time_x - prefix_w, ty), prefix, font=f_soft, fill=faint)
+        draw_time(draw, (time_x, ty), item.time, f_row, white)
         ty += px["row_height"]
     if more:
         draw.text((tx + px["dot"] + dot_gap, ty), more, font=f_soft, fill=faint)

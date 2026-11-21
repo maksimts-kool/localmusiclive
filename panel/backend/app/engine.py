@@ -820,13 +820,13 @@ class Engine:
         artist = track["artist"] if track else ""
         thumb = self.library.thumb_path(track["id"]) if track and track["has_thumb"] else None
         if phase == "next":
-            status, time_left = "Starts in {time}", until_next or 0
+            status, time_left = "Начнётся через {time}", until_next or 0
         elif until_next is not None:
-            status, time_left = "Next song in {time}", until_next
+            status, time_left = "Следующая песня через {time}", until_next
         else:
-            status, time_left = "{time} left", length - position
+            status, time_left = "Осталось {time}", length - position
         return overlay.Card(
-            heading="Up next" if phase == "next" else "Now playing",
+            heading="Далее" if phase == "next" else "Сейчас играет",
             title=title,
             artist=artist,
             status=status,
@@ -836,26 +836,33 @@ class Engine:
             opacity=round(opacity, 2),
         )
 
-    def _queued_slots(self) -> list[Slot]:
-        """The queued songs that follow the one on air, in play order."""
-        slots = []
+    def _queued_slots(self) -> list[tuple[Slot, float]]:
+        """The queued songs that follow the one on air, in play order, each with
+        how long after the song on air ends it starts."""
+        slots, offset = [], 0.0
         for slot in self._following():
-            if slot.kind == "gap" or slot.part != 0:
+            if slot.part != 0:
+                continue  # counted in full with its first part
+            if slot.kind == "gap":
+                offset += slot.length
                 continue
             if slot.kind != "queue":
                 break  # the queue always plays first, then autoplay
-            slots.append(slot)
+            slots.append((slot, offset))
+            offset += (slot.full_out or slot.out) - slot.seek
         return slots
 
-    def _queue_card(self, slots: list[Slot], settings: dict, opacity: float) -> overlay.QueueCard:
+    def _queue_card(self, slots: list[tuple[Slot, float]], remaining: float, settings: dict,
+                    opacity: float) -> overlay.QueueCard:
+        """`remaining`: seconds until the song on air ends."""
         rows = max(1, int(settings["queue_rows"]))
         items = []
-        for i, slot in enumerate(slots[:rows]):
+        for i, (slot, offset) in enumerate(slots[:rows]):
             track = self._track(slot.track_id)
             items.append(overlay.QueueItem(
                 title=track["title"] if track else slot.title,
                 artist=track["artist"] if track else "",
-                time=clock((slot.full_out or slot.out) - slot.seek),
+                time=clock(remaining + offset),
                 color=overlay.segment_color(i + 1, settings),
             ))
         return overlay.QueueCard(items, max(0, len(slots) - rows), opacity)
@@ -884,19 +891,20 @@ class Engine:
         line = None
         if opacity > 0 and length > 0:
             lengths = (length,) + tuple(
-                (s.full_out or s.out) - s.seek for s in queued[:LINE_MAX_QUEUED]
+                (s.full_out or s.out) - s.seek for s, _ in queued[:LINE_MAX_QUEUED]
             )
             line = overlay.Line(lengths, position - position % LINE_STEP, opacity)
 
         queue = None
         if settings["queue_card"] and queued:
-            sig = (cur.date, cur.index, tuple(s.queue_id for s in queued))
+            sig = (cur.date, cur.index, tuple(s.queue_id for s, _ in queued))
             now = time.monotonic()
             if sig != self._queue_sig:
                 self._queue_appeared = self._queue_sig is None
                 self._queue_sig, self._queue_since = sig, now
             queue = self._queue_card(
-                queued, settings, queue_opacity(now - self._queue_since, self._queue_appeared, settings)
+                queued, length - position, settings,
+                queue_opacity(now - self._queue_since, self._queue_appeared, settings),
             )
         else:
             self._queue_sig = None
@@ -913,20 +921,21 @@ class Engine:
         queued = self._queued_slots() if managed else []
         if not queued:
             queued = [
-                Slot(kind="queue", path="", seek=0, out=180, duration=180, title="Requested song"),
-                Slot(kind="queue", path="", seek=0, out=245, duration=245, title="Another one"),
+                (Slot(kind="queue", path="", seek=0, out=180, duration=180, title="Заказанная песня"), 0.0),
+                (Slot(kind="queue", path="", seek=0, out=245, duration=245, title="Ещё одна песня"), 180.0),
             ]
         queue = None
         if settings["queue_card"]:
             dim = settings["queue_dim_opacity"] if phase == "line" else 1.0
-            queue = self._queue_card(queued, settings, dim)
+            # Same moment as the sample song card: 64 s into a 212 s song.
+            queue = self._queue_card(queued, 148.0, settings, dim)
         if phase == "line":
-            lengths = (212.0,) + tuple((s.full_out or s.out) - s.seek for s in queued[:LINE_MAX_QUEUED])
+            lengths = (212.0,) + tuple((s.full_out or s.out) - s.seek for s, _ in queued[:LINE_MAX_QUEUED])
             image = overlay.compose(None, overlay.Line(lengths, 64.0, 1.0), settings, size, queue)
         else:
             now_slot = cur.slot if managed else None
             nxt = self._next_slot()
-            sample = Slot(kind="auto", path="", seek=0, out=212, duration=212, title="Artist – Song title")
+            sample = Slot(kind="auto", path="", seek=0, out=212, duration=212, title="Исполнитель – Название песни")
             card = self._card_for(
                 phase, 1.0, 64.0, 148.0, 212.0, now_slot or sample, nxt or now_slot or sample
             ) if settings["enabled"] else None
