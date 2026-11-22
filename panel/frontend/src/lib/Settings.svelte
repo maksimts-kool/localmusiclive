@@ -3,12 +3,13 @@
   import Icon from './Icon.svelte';
   import { api } from './api.js';
   import { attempt } from './toast.svelte.js';
+  import { LEVELS } from './levels.js';
 
   let { autoplay, overlay, resolution = [1280, 720], onClose } = $props();
 
   // Edit copies of the settings at the time the dialog opened; saved explicitly.
-  let ap = $state(untrack(() => ({ ...autoplay, categories: [...(autoplay.categories ?? [])] })));
-  let categories = $state([]);
+  let ap = $state(untrack(() => ({ ...autoplay, levels: [...(autoplay.levels ?? [2, 1])] })));
+  let counts = $state({});
   let ov = $state(untrack(() => ({ ...overlay })));
   let folders = $state([]);
   let dialog;
@@ -16,14 +17,14 @@
   $effect(() => {
     dialog.showModal();
     api.get('/api/library/folders').then((f) => (folders = f)).catch(() => {});
-    api.get('/api/categories').then((c) => (categories = c)).catch(() => {});
+    api
+      .get('/api/levels')
+      .then((rows) => (counts = Object.fromEntries(rows.map((r) => [r.level, r.count]))))
+      .catch(() => {});
   });
 
-  function toggleCategory(name) {
-    const key = name.toLowerCase();
-    ap.categories = ap.categories.some((c) => c.toLowerCase() === key)
-      ? ap.categories.filter((c) => c.toLowerCase() !== key)
-      : [...ap.categories, name];
+  function toggleLevel(value) {
+    ap.levels = ap.levels.includes(value) ? ap.levels.filter((l) => l !== value) : [...ap.levels, value];
   }
 
   const positions = [
@@ -125,19 +126,22 @@
           {#each folders as f}<option value={f}>{f}</option>{/each}
         </select>
       </label>
-      {#if categories.length}
-        <div class="wide">
-          <span>Only these categories <span class="muted">(none picked = every song)</span></span>
-          <div class="cat-chips">
-            {#each categories as c (c.name)}
-              {@const on = ap.categories.some((n) => n.toLowerCase() === c.name.toLowerCase())}
-              <button type="button" class="cat-chip" class:on aria-pressed={on} disabled={!ap.enabled} onclick={() => toggleCategory(c.name)}>
-                {c.name} <span class="n">{c.count}</span>
-              </button>
-            {/each}
-          </div>
+      <div class="wide">
+        <span>Play these levels <span class="muted">(none picked = every song)</span></span>
+        <div class="level-chips">
+          {#each LEVELS as l (l.value)}
+            {@const on = ap.levels.includes(l.value)}
+            <button type="button" class="level-chip {l.key}" class:on aria-pressed={on} disabled={!ap.enabled} onclick={() => toggleLevel(l.value)}>
+              {l.name} <span class="n">{counts[l.value] ?? 0}</span>
+            </button>
+          {/each}
         </div>
-      {/if}
+        <span class="muted small">
+          {ap.mode === 'in_order'
+            ? 'In library order plays each picked song once per round.'
+            : 'Отлично songs come up about 3× as often as Хорошо ones, Плохо ones about a third as often.'}
+        </span>
+      </div>
       <label>
         <span>Don't repeat within (songs)</span>
         <input type="number" min="0" max="500" bind:value={ap.avoid_repeat} disabled={!ap.enabled || ap.mode === 'in_order'} />
@@ -386,13 +390,13 @@
     color: var(--muted);
   }
 
-  .cat-chips {
+  .level-chips {
     display: flex;
     flex-wrap: wrap;
     gap: 6px;
   }
 
-  .cat-chip {
+  .level-chip {
     height: 28px;
     padding: 0 11px;
     border-radius: 99px;
@@ -402,18 +406,31 @@
     font-size: 12.5px;
   }
 
-  .cat-chip.on {
+  .level-chip.on {
+    --tone: var(--accent);
     border-color: transparent;
-    background: color-mix(in srgb, var(--accent) 20%, transparent);
-    color: var(--accent);
+    background: color-mix(in srgb, var(--tone) 20%, transparent);
+    color: var(--tone);
     font-weight: 600;
   }
 
-  .cat-chip:disabled {
+  .level-chip.great.on {
+    --tone: var(--ok);
+  }
+
+  .level-chip.bad.on {
+    --tone: var(--live);
+  }
+
+  .level-chip:disabled {
     opacity: 0.45;
   }
 
-  .cat-chip .n {
+  .wide .small {
+    font-size: 12px;
+  }
+
+  .level-chip .n {
     margin-left: 2px;
     opacity: 0.6;
   }

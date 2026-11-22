@@ -24,6 +24,7 @@ use crate::db::{self, Db, Track};
 use crate::discover::{self, Source};
 use crate::engine::{Engine, EngineError};
 use crate::hub::Hub;
+use crate::levels;
 use crate::library::Library;
 use crate::settings::Settings;
 use crate::util::{now, run};
@@ -136,6 +137,11 @@ pub fn download_formats(max_height: i64) -> String {
     } else {
         "bv*+ba/b".into()
     }
+}
+
+/// How strongly a library song points to new ones: its plays, by its level.
+fn favourite(track: &Track) -> i64 {
+    (track.play_count + 1) * levels::favourite_factor(track.level)
 }
 
 pub fn thumbnail(video_id: &str) -> String {
@@ -339,20 +345,27 @@ impl YouTube {
 
     fn seeds(&self) -> Result<Vec<Track>> {
         let conn = self.db.lock();
+        // Favourites: played songs and every Отлично song, never Плохо ones.
+        let favour = levels::FAVOURITE_SQL;
         let rows = db::tracks(
             &conn,
-            "SELECT * FROM tracks WHERE missing = 0 AND play_count > 0 \
-             ORDER BY play_count DESC, last_played_at DESC LIMIT ?",
+            &format!(
+                "SELECT * FROM tracks WHERE missing = 0 AND {favour} > 0 AND (play_count > 0 OR level = {great}) \
+                 ORDER BY (play_count + 1) * {favour} DESC, last_played_at DESC LIMIT ?",
+                great = levels::GREAT
+            ),
             [SUGGEST_SEED_POOL],
         )?;
         let mut rng = rand::rng();
-        let weights: Vec<f64> = rows.iter().map(|r| r.play_count as f64).collect();
+        let weights: Vec<f64> = rows.iter().map(|r| favourite(r) as f64).collect();
         let mut rows = discover::weighted_sample(rows, &weights, SUGGEST_SEEDS, &mut rng);
         if rows.len() < SUGGEST_SEEDS {
             // Little history yet: fill up with random newer songs.
             let taken: Vec<i64> = if rows.is_empty() { vec![0] } else { rows.iter().map(|r| r.id).collect() };
             let sql = format!(
-                "SELECT * FROM tracks WHERE missing = 0 AND id NOT IN ({}) ORDER BY added_at DESC LIMIT {SUGGEST_SEED_POOL}",
+                "SELECT * FROM tracks WHERE missing = 0 AND level != {} AND id NOT IN ({}) \
+                 ORDER BY added_at DESC LIMIT {SUGGEST_SEED_POOL}",
+                levels::BAD,
                 db::marks(taken.len())
             );
             let newer = db::tracks(&conn, &sql, rusqlite::params_from_iter(taken.iter()))?;
@@ -360,17 +373,19 @@ impl YouTube {
             let ones = vec![1.0; newer.len()];
             rows.extend(discover::weighted_sample(newer, &ones, want, &mut rng));
         }
-        rows.sort_by(|a, b| b.play_count.cmp(&a.play_count));
+        rows.sort_by_key(|r| std::cmp::Reverse(favourite(r)));
         Ok(rows)
     }
 
     fn artists(&self) -> Result<Vec<(String, i64)>> {
         let conn = self.db.lock();
-        let mut stmt = conn.prepare(
-            "SELECT artist, SUM(play_count) AS plays FROM tracks \
+        // Plays of Отлично songs count three times, of Плохо ones not at all.
+        let mut stmt = conn.prepare(&format!(
+            "SELECT artist, SUM(play_count * {}) AS plays FROM tracks \
              WHERE missing = 0 AND artist != '' GROUP BY artist COLLATE NOCASE \
              HAVING plays > 0 ORDER BY plays DESC LIMIT ?",
-        )?;
+            levels::FAVOURITE_SQL
+        ))?;
         let rows: Vec<(String, i64)> = stmt
             .query_map([SUGGEST_ARTIST_POOL], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
@@ -392,13 +407,14 @@ impl YouTube {
             let end = SUGGEST_MIX_LENGTH.to_string();
             entries = self.entries(&url, &["--playlist-end", &end]).await;
         }
-        Source { kind: "mix", name: row.title.clone(), plays: row.play_count, entries }
+        let boost = if row.level == levels::GREAT { 1.5 } else { 1.0 };
+        Source { kind: "mix", name: row.title.clone(), plays: row.play_count, boost, entries }
     }
 
     async fn by_artist(&self, artist: &str, plays: i64, sem: &Semaphore) -> Source {
         let _permit = sem.acquire().await;
         let entries = self.entries(&format!("ytsearch12:{artist} music video"), &[]).await;
-        Source { kind: "artist", name: artist.to_string(), plays, entries }
+        Source { kind: "artist", name: artist.to_string(), plays, boost: 1.0, entries }
     }
 
     /// New songs to download, from the most-played songs in the library.
@@ -424,21 +440,29 @@ impl YouTube {
         let (mut sources, more) = futures::join!(mixes, by_artist);
         sources.extend(more);
 
-        let (have_ids, have_keys, artist_songs) = {
+        let (have_ids, have_keys, artist_songs, disliked) = {
             let conn = self.db.lock();
-            let mut stmt = conn.prepare("SELECT artist, title, path FROM tracks")?;
-            let rows: Vec<(String, String, String)> = stmt
-                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            let mut stmt = conn.prepare("SELECT artist, title, path, level FROM tracks")?;
+            let rows: Vec<(String, String, String, i64)> = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
                 .collect::<rusqlite::Result<_>>()?;
-            let have_ids: HashSet<String> = rows.iter().filter_map(|(_, _, p)| id_in_path(p)).collect();
-            let have_keys: HashSet<String> = rows.iter().map(|(a, t, _)| discover::song_key(a, t)).collect();
+            let have_ids: HashSet<String> = rows.iter().filter_map(|(_, _, p, _)| id_in_path(p)).collect();
+            let have_keys: HashSet<String> = rows.iter().map(|(a, t, _, _)| discover::song_key(a, t)).collect();
+            // Liked songs per artist; artists with only Плохо songs are disliked.
             let mut artist_songs: HashMap<String, i64> = HashMap::new();
-            for (artist, _, _) in &rows {
+            let mut disliked: HashSet<String> = HashSet::new();
+            for (artist, _, _, level) in &rows {
                 if !artist.is_empty() {
-                    *artist_songs.entry(artist.to_lowercase()).or_default() += 1;
+                    let key = artist.to_lowercase();
+                    if *level == levels::BAD {
+                        disliked.insert(key);
+                    } else {
+                        *artist_songs.entry(key).or_default() += 1;
+                    }
                 }
             }
-            (have_ids, have_keys, artist_songs)
+            disliked.retain(|a| !artist_songs.contains_key(a));
+            (have_ids, have_keys, artist_songs, disliked)
         };
 
         let ranked = discover::rank(
@@ -446,6 +470,7 @@ impl YouTube {
             &have_ids,
             &have_keys,
             &artist_songs,
+            &disliked,
             |title, channel| split_title(title, channel, None, None),
             SUGGEST_LIMIT * 4,
         );
@@ -480,7 +505,7 @@ impl YouTube {
                 .collect();
             let result = json!({
                 "based_on": seeds.iter().map(|r| json!({
-                    "id": r.id, "title": r.title, "artist": r.artist, "plays": r.play_count,
+                    "id": r.id, "title": r.title, "artist": r.artist, "plays": r.play_count, "level": r.level,
                 })).collect::<Vec<_>>(),
                 "items": items,
                 "created_at": now(),

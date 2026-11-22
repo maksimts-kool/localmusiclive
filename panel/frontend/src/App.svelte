@@ -14,6 +14,8 @@
   let receivedAt = $state(0);
   let connected = $state(false);
   let libraryVersion = $state(0);
+  // The latest one-song level change, from any browser.
+  let levelChange = $state(null);
   let tab = $state('queue');
   let source = $state('library');
   let settingsOpen = $state(false);
@@ -34,6 +36,8 @@
           receivedAt = performance.now() / 1000;
         } else if (message.type === 'library') {
           libraryVersion++;
+        } else if (message.type === 'level') {
+          levelChange = { id: message.id, level: message.level };
         }
       };
       socket.onclose = () => {
@@ -155,7 +159,7 @@
       </button>
     </div>
     {#if source === 'library'}
-      <Library version={libraryVersion} {queuedIds} scanning={status?.scanning} size={status?.library_size ?? 0} />
+      <Library version={libraryVersion} {levelChange} {queuedIds} scanning={status?.scanning} size={status?.library_size ?? 0} />
     {:else}
       <YouTube {downloads} />
     {/if}

@@ -1,18 +1,21 @@
 <script>
+  import { untrack } from 'svelte';
   import Icon from './Icon.svelte';
-  import CategoryEditor from './CategoryEditor.svelte';
+  import LevelPicker from './LevelPicker.svelte';
   import { api } from './api.js';
   import { attempt, toast } from './toast.svelte.js';
   import { duration } from './format.js';
+  import { LEVELS, levelOf } from './levels.js';
 
-  let { version, queuedIds, scanning, size } = $props();
+  let { version, levelChange, queuedIds, scanning, size } = $props();
 
   const PAGE = 60;
   let query = $state('');
   let folder = $state('');
-  let category = $state('');
-  let categories = $state([]);
-  // Track id whose categories are being edited, or 'bulk' for every match.
+  // '' for every level, else '0', '1' or '2'.
+  let level = $state('');
+  let counts = $state({});
+  // Track id whose level is being picked, or 'bulk' for every match.
   let editing = $state(null);
   let sort = $state('artist');
   let folders = $state([]);
@@ -28,7 +31,7 @@
     const params = new URLSearchParams({
       q: query,
       folder,
-      category,
+      level,
       sort,
       limit: PAGE,
       offset: reset ? 0 : items.length,
@@ -47,7 +50,7 @@
 
   // Reload when the filters change (search is debounced) or the library is rescanned.
   $effect(() => {
-    const deps = [query, folder, category, sort, version];
+    const deps = [query, folder, level, sort, version];
     const timer = setTimeout(() => load(true), deps[0] ? 200 : 0);
     return () => clearTimeout(timer);
   });
@@ -55,50 +58,52 @@
   $effect(() => {
     version;
     api.get('/api/library/folders').then((f) => (folders = f)).catch(() => {});
-    loadCategories();
+    loadCounts();
   });
 
-  function loadCategories() {
-    return api.get('/api/categories').then((c) => (categories = c)).catch(() => {});
-  }
-
-  let filtered = $derived(Boolean(query.trim() || folder || category));
-
-  // Saves run one after another, so quick clicks never send a stale list.
-  let saving = Promise.resolve();
-
-  function setCategories(id, categories) {
-    items = items.map((t) => (t.id === id ? { ...t, categories } : t));
-  }
-
-  function toggle(track, name) {
-    // Start from the latest list (the row may have changed since it was drawn).
-    const current = items.find((t) => t.id === track.id)?.categories ?? track.categories;
-    const key = name.toLowerCase();
-    const next = current.some((c) => c.toLowerCase() === key)
-      ? current.filter((c) => c.toLowerCase() !== key)
-      : [...current, name];
-    setCategories(track.id, next);
-    saving = saving.then(async () => {
-      try {
-        const saved = await api.put(`/api/tracks/${track.id}/categories`, { categories: next });
-        // Only take the server's spelling if nothing newer was picked meanwhile.
-        const now = items.find((t) => t.id === track.id)?.categories;
-        if (now === next) setCategories(track.id, saved.categories);
-        loadCategories();
-      } catch (error) {
-        toast(error.message, 'error');
-      }
+  // A song rated elsewhere (now playing, another browser): update its row.
+  $effect(() => {
+    const change = levelChange;
+    if (!change) return;
+    untrack(() => {
+      setLevel(change.id, change.level);
+      loadCounts();
     });
+  });
+
+  function loadCounts() {
+    return api
+      .get('/api/levels')
+      .then((rows) => (counts = Object.fromEntries(rows.map((r) => [r.level, r.count]))))
+      .catch(() => {});
   }
 
-  async function bulk(change) {
-    const filter = { q: query, folder, category };
+  let filtered = $derived(Boolean(query.trim() || folder || level));
+
+  function setLevel(id, value) {
+    items = items.map((t) => (t.id === id ? { ...t, level: value } : t));
+  }
+
+  async function rate(track, value) {
+    editing = null;
+    const before = track.level;
+    if (value === before) return;
+    setLevel(track.id, value);
     try {
-      const { changed } = await api.post('/api/categories/bulk', { ...filter, ...change });
-      const name = change.add ?? change.remove;
-      toast(changed ? `${change.add ? 'Added' : 'Removed'} “${name}” on ${changed} song${changed === 1 ? '' : 's'}` : 'Nothing to change');
-      if (change.remove) editing = null;
+      await api.put(`/api/tracks/${track.id}/level`, { level: value });
+    } catch (error) {
+      setLevel(track.id, before);
+      toast(error.message, 'error');
+    }
+  }
+
+  async function bulk(value) {
+    const name = levelOf(value).name;
+    if (!confirm(`Set all ${total} song${total === 1 ? '' : 's'} shown to “${name}”?`)) return;
+    try {
+      const { changed } = await api.post('/api/levels/bulk', { q: query, folder, level, set: value });
+      toast(changed ? `${changed} song${changed === 1 ? '' : 's'} set to “${name}”` : 'Nothing to change');
+      editing = null;
     } catch (error) {
       toast(error.message, 'error');
     }
@@ -128,7 +133,7 @@
       total -= 1;
       if (editing === track.id) editing = null;
       toast(`Deleted ${name}`);
-      loadCategories();
+      loadCounts();
     } catch (error) {
       toast(error.message, 'error');
     }
@@ -156,14 +161,14 @@
     <option value="">All folders</option>
     {#each folders as f}<option value={f}>{f}</option>{/each}
   </select>
-  <select bind:value={category} aria-label="Category">
-    <option value="">All categories</option>
-    {#each categories as c}<option value={c.name}>{c.name} ({c.count})</option>{/each}
-    <option value="__none__">No category</option>
+  <select bind:value={level} aria-label="Level">
+    <option value="">All levels</option>
+    {#each LEVELS as l}<option value={String(l.value)}>{l.name} ({counts[l.value] ?? 0})</option>{/each}
   </select>
   <select bind:value={sort} aria-label="Sort">
     <option value="artist">Artist</option>
     <option value="title">Title</option>
+    <option value="level">Level</option>
     <option value="added">Recently added</option>
     <option value="recent">Recently played</option>
     <option value="played">Most played</option>
@@ -173,29 +178,19 @@
 {#if filtered && total}
   <div class="bulk">
     <span class="muted">{total} song{total === 1 ? '' : 's'} shown</span>
-    {#if category && category !== '__none__'}
-      <button class="btn small" onclick={() => confirm(`Remove “${category}” from ${total} songs?`) && bulk({ remove: category })}>
-        Remove “{category}”
-      </button>
-    {/if}
     <button class="btn small" class:active={editing === 'bulk'} onclick={() => (editing = editing === 'bulk' ? null : 'bulk')}>
-      <Icon name="tag" size={14} /> Tag all
+      <Icon name="star" size={14} /> Set level for all
     </button>
   </div>
   {#if editing === 'bulk'}
-    <CategoryEditor
-      all={categories}
-      selected={[]}
-      placeholder="Category to add to all {total}…"
-      onToggle={(name) => bulk({ add: name })}
-      onDone={() => (editing = null)}
-    />
+    <div class="picker bulk-picker"><LevelPicker onPick={bulk} /></div>
   {/if}
 {/if}
 
 <ul class="list">
   {#each items as track (track.id)}
-    <li class="row" ondblclick={() => add(track, false)}>
+    {@const lvl = levelOf(track.level)}
+    <li class="row" class:bad={track.level === 0} ondblclick={() => add(track, false)}>
       <div class="thumb small" style:background-image={track.thumb ? `url(${track.thumb})` : null}>
         {#if !track.thumb}<Icon name="music" size={16} />{/if}
       </div>
@@ -211,23 +206,16 @@
         <div class="ellipsis muted sub">
           {track.artist || track.folder || ' '}
         </div>
-        {#if track.categories?.length}
-          <div class="cats">
-            {#each track.categories as c}
-              <button class="cat" title="Show only {c}" onclick={() => (category = c)}>{c}</button>
-            {/each}
-          </div>
-        {/if}
       </div>
       {#if queuedIds.has(track.id)}<span class="badge queue">Queued</span>{/if}
       <span class="muted dur">{duration(track.duration)}</span>
       <button
-        class="icon-btn"
+        class="icon-btn level-btn {lvl.key}"
         class:active={editing === track.id}
-        title="Categories"
+        title="Level: {lvl.name}"
         onclick={() => (editing = editing === track.id ? null : track.id)}
       >
-        <Icon name="tag" size={16} />
+        <Icon name={track.level === 0 ? 'thumbs-down' : 'star'} size={16} filled={track.level === 2} />
       </button>
       <button class="icon-btn" title="Play next" onclick={() => add(track, true)}>
         <Icon name="next" size={17} />
@@ -240,14 +228,7 @@
       </button>
     </li>
     {#if editing === track.id}
-      <li>
-        <CategoryEditor
-          all={categories}
-          selected={track.categories}
-          onToggle={(name) => toggle(track, name)}
-          onDone={() => (editing = null)}
-        />
-      </li>
+      <li class="picker"><LevelPicker value={track.level} onPick={(value) => rate(track, value)} /></li>
     {/if}
   {/each}
 </ul>
@@ -388,26 +369,28 @@
     color: var(--accent);
   }
 
-  .cats {
+  .row.bad .thumb,
+  .row.bad .title {
+    opacity: 0.55;
+  }
+
+  .level-btn.great {
+    color: var(--ok);
+  }
+
+  .level-btn.bad {
+    color: var(--live);
+  }
+
+  .picker {
+    list-style: none;
     display: flex;
-    flex-wrap: wrap;
-    gap: 4px;
-    margin-top: 3px;
+    justify-content: flex-end;
+    padding: 2px 4px 8px;
   }
 
-  .cat {
-    height: 18px;
-    padding: 0 7px;
-    border: 0;
-    border-radius: 99px;
-    background: var(--surface-3);
-    color: var(--muted);
-    font-size: 11px;
-    font-weight: 600;
-  }
-
-  .cat:hover {
-    color: var(--accent);
+  .bulk-picker {
+    margin-top: -2px;
   }
 
   .bulk {

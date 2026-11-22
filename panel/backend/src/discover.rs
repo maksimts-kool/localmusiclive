@@ -43,6 +43,8 @@ pub struct Source {
     /// The song's title, or the artist.
     pub name: String,
     pub plays: i64,
+    /// Weighs this source's finds up (an Отлично song) or down.
+    pub boost: f64,
     pub entries: Vec<Value>,
 }
 
@@ -58,19 +60,21 @@ struct Found {
 ///
 /// entries are YouTube results ({"id", "title", "channel", "duration", ...});
 /// split(title, channel) gives (artist, song title); artist_songs counts
-/// library songs per lowercased artist.
+/// liked (not Плохо) library songs per lowercased artist; songs by disliked
+/// artists (only Плохо songs in the library) rank far lower.
 pub fn rank(
     sources: &[Source],
     have_ids: &HashSet<String>,
     have_keys: &HashSet<String>,
     artist_songs: &HashMap<String, i64>,
+    disliked: &HashSet<String>,
     split: impl Fn(&str, &str) -> (String, String),
     limit: usize,
 ) -> Vec<Map<String, Value>> {
     let mut order: Vec<String> = Vec::new();
     let mut found: HashMap<String, Found> = HashMap::new();
     for source in sources {
-        let mut weight = 1.0 + (source.plays as f64).ln_1p();
+        let mut weight = (1.0 + (source.plays as f64).ln_1p()) * source.boost;
         if source.kind == "artist" {
             weight *= 0.7;
         }
@@ -123,6 +127,9 @@ pub fn rank(
         }
         if item.related.len() > 1 {
             item.score *= 1.0 + 0.15 * (item.related.len() - 1) as f64;
+        }
+        if disliked.contains(&item.artist.to_lowercase()) {
+            item.score *= 0.25;
         }
         let reasons = reasons(item, songs);
         item.entry.insert("reasons".into(), Value::from(reasons));
@@ -241,6 +248,7 @@ mod tests {
                 kind: "mix",
                 name: "Bohemian Rhapsody".into(),
                 plays: 12,
+                boost: 1.0,
                 entries: vec![
                     e("seed1", "Queen - Bohemian Rhapsody (Official Video)"),
                     e("a", "Queen - Don't Stop Me Now (Official Video)"),
@@ -255,6 +263,7 @@ mod tests {
                 kind: "mix",
                 name: "Levitating".into(),
                 plays: 2,
+                boost: 1.0,
                 entries: vec![e("g", "Dua Lipa - Physical"), e("f2", "David Bowie - Starman (2012 Remaster)")],
             },
         ];
@@ -263,6 +272,7 @@ mod tests {
             &HashSet::from([format!("{:x<11}", "seed1")]),
             &HashSet::from([song_key("Muse", "Uprising")]),
             &HashMap::from([("queen".to_string(), 3)]),
+            &HashSet::new(),
             split,
             20,
         );
@@ -282,11 +292,13 @@ mod tests {
                 kind: "mix",
                 name: "Cheri Cheri Lady".into(),
                 plays: 6,
+                boost: 1.0,
                 entries: vec![e("a", "Modern Talking - Cheri Cheri Lady (Remix 2024)")],
             }],
             &HashSet::new(),
             &HashSet::from([song_key("Modern Talking", "Cheri Cheri Lady")]),
             &HashMap::new(),
+            &HashSet::new(),
             split,
             20,
         );
@@ -296,14 +308,30 @@ mod tests {
     #[test]
     fn artist_source_reason() {
         let ranked = rank(
-            &[Source { kind: "artist", name: "Queen".into(), plays: 30, entries: vec![e("a", "Queen - Radio Ga Ga")] }],
+            &[Source { kind: "artist", name: "Queen".into(), plays: 30, boost: 1.0, entries: vec![e("a", "Queen - Radio Ga Ga")] }],
             &HashSet::new(),
             &HashSet::new(),
             &HashMap::from([("queen".to_string(), 3)]),
+            &HashSet::new(),
             split,
             20,
         );
         assert_eq!(reasons(&ranked[0]), ["More Queen"]);
+    }
+
+    #[test]
+    fn levels_weigh_sources_and_disliked_artists() {
+        let source = |name: &str, boost: f64, entries| Source { kind: "mix", name: name.into(), plays: 4, boost, entries };
+        let sources = [
+            source("Good song", 1.0, vec![e("a", "Muse - Uprising")]),
+            source("Great song", 1.5, vec![e("b", "Queen - Radio Ga Ga")]),
+            source("Another", 1.0, vec![e("c", "Nickelback - Photograph")]),
+        ];
+        let ranked = rank(&sources, &HashSet::new(), &HashSet::new(), &HashMap::new(), &HashSet::new(), split, 20);
+        assert_eq!(titles(&ranked)[0], "Queen - Radio Ga Ga");
+        let ranked =
+            rank(&sources, &HashSet::new(), &HashSet::new(), &HashMap::new(), &HashSet::from(["nickelback".into()]), split, 20);
+        assert_eq!(titles(&ranked)[2], "Nickelback - Photograph");
     }
 
     #[test]

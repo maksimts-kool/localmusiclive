@@ -16,11 +16,11 @@ use serde_json::{json, Map, Value};
 use tokio::sync::broadcast::error::RecvError;
 use tower_http::services::ServeDir;
 
-use crate::categories::{categories_of, clean_categories, fold, to_json};
 use crate::db::{self, Db};
 use crate::engine::{merged, track_json, Engine, EngineError};
 use crate::ffplayout::FfError;
 use crate::hub::Hub;
+use crate::levels;
 use crate::library::Library;
 use crate::overlay::POSITIONS;
 use crate::settings::Settings;
@@ -87,7 +87,6 @@ enum Rule {
     Choice(&'static [&'static str]),
     Color,
     Text(usize),
-    TextList(usize),
     IntList,
 }
 
@@ -136,16 +135,6 @@ fn check(key: &str, value: &Value, rule: &Rule) -> Result<Value, ApiError> {
             Some(_) => Err(bad(&format!("must be at most {max} characters"))),
             None => Err(bad("must be text")),
         },
-        Rule::TextList(max) => {
-            let items = value.as_array().ok_or_else(|| bad("must be a list"))?;
-            if items.len() > *max {
-                return Err(bad(&format!("must have at most {max} items")));
-            }
-            if items.iter().any(|i| !i.is_string()) {
-                return Err(bad("must be a list of text"));
-            }
-            Ok(value.clone())
-        }
         Rule::IntList => {
             let items = value.as_array().ok_or_else(|| bad("must be a list"))?;
             if items.iter().any(|i| i.as_i64().is_none()) {
@@ -212,9 +201,9 @@ pub fn router(app: App) -> Router {
         .route("/ws", get(websocket))
         .route("/api/library", get(list_library))
         .route("/api/library/folders", get(list_folders))
-        .route("/api/categories", get(list_categories))
-        .route("/api/tracks/{track_id}/categories", put(put_track_categories))
-        .route("/api/categories/bulk", post(bulk_categories))
+        .route("/api/levels", get(level_counts))
+        .route("/api/tracks/{track_id}/level", put(put_track_level))
+        .route("/api/levels/bulk", post(bulk_level))
         .route("/api/library/rescan", post(rescan))
         .route("/api/tracks/{track_id}", delete(delete_track))
         .route("/api/thumbs/{file}", get(thumb))
@@ -290,12 +279,11 @@ async fn serve_socket(mut socket: WebSocket, app: App) {
 
 // --- library --------------------------------------------------------------------------
 
-const UNCATEGORIZED: &str = "__none__";
-
 fn sort_clause(sort: &str) -> Option<&'static str> {
     Some(match sort {
         "artist" => "artist COLLATE NOCASE, title COLLATE NOCASE",
         "title" => "title COLLATE NOCASE, artist COLLATE NOCASE",
+        "level" => "level DESC, artist COLLATE NOCASE, title COLLATE NOCASE",
         "added" => "added_at DESC",
         "played" => "play_count DESC, last_played_at DESC",
         "recent" => "last_played_at IS NULL, last_played_at DESC",
@@ -303,17 +291,29 @@ fn sort_clause(sort: &str) -> Option<&'static str> {
     })
 }
 
-fn library_filter(q: &str, folder: &str, category: &str) -> (String, Vec<String>) {
+/// A level filter: empty for every song, else 0, 1 or 2.
+fn level_param(raw: &str) -> Result<Option<i64>, ApiError> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    match raw.parse::<i64>() {
+        Ok(level) if levels::valid(level) => Ok(Some(level)),
+        _ => Err(ApiError::invalid("level: must be 0, 1 or 2")),
+    }
+}
+
+fn library_filter(q: &str, folder: &str, level: Option<i64>) -> (String, Vec<String>) {
     let mut clauses = vec!["missing = 0".to_string()];
     let mut args = Vec::new();
     for word in q.split_whitespace() {
         let like = format!("%{}%", word.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
         clauses.push(
             "(artist LIKE ? ESCAPE '\\' OR title LIKE ? ESCAPE '\\' \
-             OR album LIKE ? ESCAPE '\\' OR path LIKE ? ESCAPE '\\' OR categories LIKE ? ESCAPE '\\')"
+             OR album LIKE ? ESCAPE '\\' OR path LIKE ? ESCAPE '\\')"
                 .into(),
         );
-        args.extend(std::iter::repeat_n(like, 5));
+        args.extend(std::iter::repeat_n(like, 4));
     }
     let folder = folder.trim_matches('/');
     if !folder.is_empty() {
@@ -321,11 +321,8 @@ fn library_filter(q: &str, folder: &str, category: &str) -> (String, Vec<String>
         args.push(folder.to_string());
         args.push(format!("{folder}/%"));
     }
-    if category == UNCATEGORIZED {
-        clauses.push("json_array_length(categories) = 0".into());
-    } else if !category.is_empty() {
-        clauses.push("EXISTS (SELECT 1 FROM json_each(tracks.categories) WHERE value = ? COLLATE NOCASE)".into());
-        args.push(category.to_string());
+    if let Some(level) = level {
+        clauses.push(format!("level = {level}"));
     }
     (clauses.join(" AND "), args)
 }
@@ -337,10 +334,10 @@ async fn list_library(State(app): State<App>, Query(q): Query<HashMap<String, St
         Some(s) => s.as_str(),
     };
     let order = sort_clause(sort)
-        .ok_or_else(|| ApiError::invalid("sort: must be one of artist, title, added, played, recent"))?;
+        .ok_or_else(|| ApiError::invalid("sort: must be one of artist, title, level, added, played, recent"))?;
     let limit = query_int(&q, "limit", 100, 1, 500)?;
     let offset = query_int(&q, "offset", 0, 0, i64::MAX)?;
-    let (clause, args) = library_filter(get("q"), get("folder"), get("category"));
+    let (clause, args) = library_filter(get("q"), get("folder"), level_param(get("level"))?);
 
     let conn = app.db.lock();
     let total: i64 = conn.query_row(
@@ -375,102 +372,53 @@ async fn list_folders(State(app): State<App>) -> ApiResult {
     Ok(Json(json!(folders)))
 }
 
-/// Songs per category, named as first seen.
-fn category_counts(conn: &rusqlite::Connection) -> Result<Vec<(String, i64)>, ApiError> {
-    let mut stmt = conn.prepare("SELECT categories FROM tracks WHERE missing = 0 AND categories != '[]'")?;
-    let rows: Vec<String> = stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
-    let mut order: Vec<String> = Vec::new();
-    let mut counts: HashMap<String, (String, i64)> = HashMap::new();
-    for row in rows {
-        for name in categories_of(&row) {
-            let key = fold(&name);
-            let entry = counts.entry(key.clone()).or_insert_with(|| {
-                order.push(key.clone());
-                (name.clone(), 0)
-            });
-            entry.1 += 1;
-        }
-    }
-    Ok(order.into_iter().filter_map(|k| counts.remove(&k)).collect())
+/// Songs per level, best first.
+async fn level_counts(State(app): State<App>) -> ApiResult {
+    let conn = app.db.lock();
+    let mut stmt = conn.prepare("SELECT level, COUNT(*) FROM tracks WHERE missing = 0 GROUP BY level")?;
+    let counts: HashMap<i64, i64> =
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+    let rows: Vec<Value> = levels::ALL
+        .iter()
+        .map(|level| json!({"level": level, "count": counts.get(level).copied().unwrap_or(0)}))
+        .collect();
+    Ok(Json(json!(rows)))
 }
 
-async fn list_categories(State(app): State<App>) -> ApiResult {
-    let mut counts = category_counts(&app.db.lock())?;
-    counts.sort_by_key(|(name, _)| fold(name));
-    Ok(Json(json!(counts.iter().map(|(name, count)| json!({"name": name, "count": count})).collect::<Vec<_>>())))
-}
-
-async fn put_track_categories(State(app): State<App>, Path(track_id): Path<String>, body: Bytes) -> ApiResult {
+async fn put_track_level(State(app): State<App>, Path(track_id): Path<String>, body: Bytes) -> ApiResult {
     let track_id = path_id(&track_id)?;
-    let body = clean(&parse_body(&body)?, &[("categories", Rule::TextList(50))])?;
-    let values: Vec<String> = required(&body, "categories")?
-        .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
-        .unwrap_or_default();
-    let names = {
-        let conn = app.db.lock();
-        if db::track(&conn, track_id)?.is_none() {
-            return Err(ApiError::not_found("That track is not in the library"));
-        }
-        let existing: Vec<String> = category_counts(&conn)?.into_iter().map(|c| c.0).collect();
-        let names = clean_categories(values.iter().map(String::as_str), existing.iter().map(String::as_str));
-        conn.execute("UPDATE tracks SET categories = ? WHERE id = ?", rusqlite::params![to_json(&names), track_id])?;
-        names
-    };
-    app.engine.categories_changed(false).await?;
-    Ok(Json(json!({"categories": names})))
+    let body = clean(&parse_body(&body)?, &[("level", Rule::Int(levels::BAD, levels::GREAT))])?;
+    let level = required(&body, "level")?.as_i64().unwrap_or(levels::GOOD);
+    let changed = app.db.lock().execute(
+        "UPDATE tracks SET level = ? WHERE id = ?",
+        rusqlite::params![level, track_id],
+    )?;
+    if changed == 0 {
+        return Err(ApiError::not_found("That track is not in the library"));
+    }
+    app.engine.levels_changed(Some((track_id, level))).await?;
+    Ok(Json(json!({"level": level})))
 }
 
-/// Add or remove one category on every song matching the library filter.
-async fn bulk_categories(State(app): State<App>, body: Bytes) -> ApiResult {
+/// Set the level of every song matching the library filter.
+async fn bulk_level(State(app): State<App>, body: Bytes) -> ApiResult {
     let body = clean(
         &parse_body(&body)?,
         &[
             ("q", Rule::Text(10_000)),
             ("folder", Rule::Text(10_000)),
-            ("category", Rule::Text(10_000)),
-            ("add", Rule::Text(10_000)),
-            ("remove", Rule::Text(10_000)),
+            ("level", Rule::Text(10)),
+            ("set", Rule::Int(levels::BAD, levels::GREAT)),
         ],
     )?;
-    let changed = {
-        let conn = app.db.lock();
-        let existing: Vec<String> = category_counts(&conn)?.into_iter().map(|c| c.0).collect();
-        let add = clean_categories([text(&body, "add")], existing.iter().map(String::as_str));
-        let remove = fold(text(&body, "remove").trim());
-        if add.is_empty() && remove.is_empty() {
-            return Err(ApiError::invalid("Name a category to add or remove"));
-        }
-        let (clause, args) = library_filter(text(&body, "q"), text(&body, "folder"), text(&body, "category"));
-        db::tx(&conn, |conn| {
-            let mut stmt = conn.prepare(&format!("SELECT id, categories FROM tracks WHERE {clause}"))?;
-            let rows: Vec<(i64, String)> = stmt
-                .query_map(rusqlite::params_from_iter(args.iter()), |r| Ok((r.get(0)?, r.get(1)?)))?
-                .collect::<rusqlite::Result<_>>()?;
-            let mut changed = 0;
-            for (id, categories) in rows {
-                let names = categories_of(&categories);
-                let mut updated: Vec<String> = if remove.is_empty() {
-                    names.clone()
-                } else {
-                    names.iter().filter(|n| fold(n) != remove).cloned().collect()
-                };
-                if let Some(new) = add.first() {
-                    if updated.iter().all(|n| fold(n) != fold(new)) {
-                        updated.push(new.clone());
-                        updated = clean_categories(updated.iter().map(String::as_str), std::iter::empty());
-                    }
-                }
-                if updated != names {
-                    conn.execute("UPDATE tracks SET categories = ? WHERE id = ?", rusqlite::params![to_json(&updated), id])?;
-                    changed += 1;
-                }
-            }
-            Ok(changed)
-        })?
-    };
+    let set = required(&body, "set")?.as_i64().unwrap_or(levels::GOOD);
+    let (clause, args) = library_filter(text(&body, "q"), text(&body, "folder"), level_param(text(&body, "level"))?);
+    let changed = app.db.lock().execute(
+        &format!("UPDATE tracks SET level = {set} WHERE {clause} AND level != {set}"),
+        rusqlite::params_from_iter(args.iter()),
+    )?;
     if changed > 0 {
-        app.engine.categories_changed(true).await?;
+        app.engine.levels_changed(None).await?;
     }
     Ok(Json(json!({"changed": changed})))
 }
@@ -586,7 +534,7 @@ fn autoplay_rules() -> Vec<(&'static str, Rule)> {
         ("enabled", Rule::Bool),
         ("mode", Rule::Choice(&["shuffle", "least_played", "in_order"])),
         ("folder", Rule::Text(10_000)),
-        ("categories", Rule::TextList(50)),
+        ("levels", Rule::IntList),
         ("avoid_repeat", Rule::Int(0, 500)),
     ]
 }
@@ -623,6 +571,11 @@ fn overlay_rules() -> Vec<(&'static str, Rule)> {
 
 async fn put_autoplay(State(app): State<App>, body: Bytes) -> ApiResult {
     let values = clean(&parse_body(&body)?, &autoplay_rules())?;
+    if let Some(list) = values.get("levels").and_then(Value::as_array) {
+        if list.iter().any(|l| !l.as_i64().is_some_and(levels::valid)) {
+            return Err(ApiError::invalid("levels: must be a list of 0, 1 and 2"));
+        }
+    }
     app.engine.set_autoplay(&values).await?;
     Ok(Json(serde_json::to_value(app.engine.autoplay_settings()).map_err(anyhow::Error::from)?))
 }
@@ -666,13 +619,16 @@ mod tests {
 
     #[test]
     fn library_filter_escapes_like_wildcards() {
-        let (clause, args) = library_filter("50%  off_", "/rock/80s/", "");
+        let (clause, args) = library_filter("50%  off_", "/rock/80s/", None);
         assert!(clause.starts_with("missing = 0 AND ("));
         assert_eq!(args[0], "%50\\%%");
-        assert_eq!(args[5], "%off\\_%");
-        assert_eq!(&args[10..], ["rock/80s", "rock/80s/%"]);
-        let (clause, args) = library_filter("", "", UNCATEGORIZED);
-        assert!(clause.ends_with("json_array_length(categories) = 0") && args.is_empty());
+        assert_eq!(args[4], "%off\\_%");
+        assert_eq!(&args[8..], ["rock/80s", "rock/80s/%"]);
+        let (clause, args) = library_filter("", "", Some(levels::GREAT));
+        assert!(clause.ends_with("level = 2") && args.is_empty());
+        assert_eq!(level_param(" 0 ").ok(), Some(Some(levels::BAD)));
+        assert_eq!(level_param("").ok(), Some(None));
+        assert!(level_param("3").is_err() && level_param("rock").is_err());
     }
 
     #[test]
@@ -693,23 +649,27 @@ mod tests {
     fn library_filter_finds_songs_in_sqlite() {
         let db = Db::memory().unwrap();
         let conn = db.lock();
-        for (path, folder, categories) in [("rock/a.mp4", "rock", "[\"Rock\"]"), ("pop/b.mp4", "pop", "[]")] {
+        for (path, folder, level) in [("rock/a.mp4", "rock", levels::GREAT), ("pop/b.mp4", "pop", levels::GOOD)] {
             conn.execute(
-                "INSERT INTO tracks (path, folder, title, duration, size, mtime, added_at, categories) \
+                "INSERT INTO tracks (path, folder, title, duration, size, mtime, added_at, level) \
                  VALUES (?, ?, ?, 1, 1, 0, 0, ?)",
-                rusqlite::params![path, folder, path, categories],
+                rusqlite::params![path, folder, path, level],
             )
             .unwrap();
         }
-        let count = |q: &str, folder: &str, category: &str| -> i64 {
-            let (clause, args) = library_filter(q, folder, category);
+        let count = |q: &str, folder: &str, level: Option<i64>| -> i64 {
+            let (clause, args) = library_filter(q, folder, level);
             conn.query_row(&format!("SELECT COUNT(*) FROM tracks WHERE {clause}"), rusqlite::params_from_iter(args.iter()), |r| r.get(0))
                 .unwrap()
         };
-        assert_eq!(count("", "", ""), 2);
-        assert_eq!(count("", "rock", ""), 1);
-        assert_eq!(count("", "", "rock"), 1);
-        assert_eq!(count("", "", UNCATEGORIZED), 1);
-        assert_eq!(count("b.mp4", "", ""), 1);
+        assert_eq!(count("", "", None), 2);
+        assert_eq!(count("", "rock", None), 1);
+        assert_eq!(count("", "", Some(levels::GREAT)), 1);
+        assert_eq!(count("", "", Some(levels::BAD)), 0);
+        assert_eq!(count("b.mp4", "", None), 1);
+        // New songs start out Хорошо.
+        conn.execute("INSERT INTO tracks (path, title, duration, size, mtime, added_at) VALUES ('c.mp4', 'c', 1, 1, 0, 0)", [])
+            .unwrap();
+        assert_eq!(count("", "", Some(levels::GOOD)), 2);
     }
 }

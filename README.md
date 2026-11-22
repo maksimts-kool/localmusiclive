@@ -89,13 +89,19 @@ have rights to will be muted or taken down there.
 
 ## Using the panel
 
-- **Library** (right): search, filter by folder, sort. `+` adds to the end of the
-  queue, the list icon plays it next. Double-click a row to queue it.
+- **Library** (right): search, filter by folder or level, sort. `+` adds to the
+  end of the queue, the list icon plays it next. Double-click a row to queue it.
+- **Levels**: every song is Отлично, Хорошо (new songs) or Плохо. Set it with the
+  star on a library row, for all songs shown with *Set level for all*, or for
+  what's on air under Now playing. Autoplay picks Отлично songs about 3× as often
+  as Хорошо ones and skips Плохо ones; new-song suggestions start from Отлично
+  and played songs, never Плохо ones, and rank artists you only have Плохо songs
+  by far lower. *Level* sorts the library best first.
 - **Up next**: drag the handle to reorder, the bin removes. Times show when each
   song will start. Below the queue is the autoplay preview.
 - **Skip** cuts to the next song immediately.
 - **Settings** (gear): autoplay order (shuffle, least played, library order), a
-  folder to draw from and how many songs before a repeat; the song card's timing,
+  folder and which levels to draw from, and how many songs before a repeat; the song card's timing,
   position, size and look, with a live preview.
 - **History**: what played, whether it was queued or autoplay, and skips.
 - **YouTube** (tab next to Library): search YouTube or paste a link. `+` downloads

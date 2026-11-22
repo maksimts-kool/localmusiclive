@@ -12,7 +12,6 @@ use rusqlite::params;
 use serde_json::Value;
 use tokio::sync::{Mutex, Semaphore};
 
-use crate::categories::{split_genres, to_json};
 use crate::db::{self, Db, Track};
 use crate::settings::{Settings, IGNORED_FOLDERS, VIDEO_EXTENSIONS};
 use crate::util::{now, round_to, run};
@@ -85,7 +84,6 @@ pub struct Info {
     pub artist: String,
     pub title: String,
     pub album: String,
-    pub genres: Vec<String>,
     pub duration: f64,
     pub width: Option<i64>,
     pub height: Option<i64>,
@@ -155,7 +153,6 @@ pub fn describe(rel_path: &str, probe: &Value) -> Option<Info> {
         artist,
         title,
         album: tag(&tags, &["album"]),
-        genres: split_genres(&tag(&tags, &["genre"])),
         duration: round_to(duration, 3),
         width: video.get("width").and_then(Value::as_i64),
         height: video.get("height").and_then(Value::as_i64),
@@ -246,10 +243,10 @@ impl Library {
                 None => {
                     conn.execute(
                         "INSERT INTO tracks (path, folder, artist, title, album, duration, width, height,\
-                         size, mtime, added_at, categories) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                         size, mtime, added_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         params![
                             path, folder, info.artist, info.title, info.album, info.duration,
-                            info.width, info.height, size, mtime, now(), to_json(&info.genres)
+                            info.width, info.height, size, mtime, now()
                         ],
                     )?;
                     Indexed::Added(conn.last_insert_rowid())
@@ -372,12 +369,11 @@ mod tests {
     #[test]
     fn names_from_tags_or_file_name() {
         let probe = json!({
-            "format": {"duration": "212.5", "tags": {"ARTIST": "Daft Punk", "title": "Get Lucky", "genre": "Disco; Funk"}},
+            "format": {"duration": "212.5", "tags": {"ARTIST": "Daft Punk", "title": "Get Lucky"}},
             "streams": [{"codec_type": "video", "width": 1920, "height": 1080}],
         });
         let info = describe("x/whatever.mp4", &probe).unwrap();
         assert_eq!((info.artist.as_str(), info.title.as_str()), ("Daft Punk", "Get Lucky"));
-        assert_eq!(info.genres, ["Disco", "Funk"]);
         assert_eq!((info.duration, info.width), (212.5, Some(1920)));
 
         let probe = json!({"format": {"duration": "200"}, "streams": [{"codec_type": "video"}]});

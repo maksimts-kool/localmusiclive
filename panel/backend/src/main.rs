@@ -2,12 +2,12 @@
 //! on-screen song card and the browsers in step with it.
 
 mod api;
-mod categories;
 mod db;
 mod discover;
 mod engine;
 mod ffplayout;
 mod hub;
+mod levels;
 mod library;
 mod overlay;
 mod raster;

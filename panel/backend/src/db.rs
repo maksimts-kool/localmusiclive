@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS tracks (
     added_at REAL NOT NULL,
     play_count INTEGER NOT NULL DEFAULT 0,
     last_played_at REAL,
-    categories TEXT NOT NULL DEFAULT '[]'  -- JSON list of names
+    level INTEGER NOT NULL DEFAULT 1    -- 2 Отлично, 1 Хорошо, 0 Плохо
 );
 
 CREATE TABLE IF NOT EXISTS queue (
@@ -94,11 +94,11 @@ impl Db {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
-        let has_categories: bool = conn
-            .prepare("SELECT 1 FROM pragma_table_info('tracks') WHERE name = 'categories'")?
-            .exists([])?;
-        if !has_categories {
-            conn.execute("ALTER TABLE tracks ADD COLUMN categories TEXT NOT NULL DEFAULT '[]'", [])?;
+        // Older libraries: songs start out Хорошо. (A leftover `categories` column is unused.)
+        let has_level: bool =
+            conn.prepare("SELECT 1 FROM pragma_table_info('tracks') WHERE name = 'level'")?.exists([])?;
+        if !has_level {
+            conn.execute("ALTER TABLE tracks ADD COLUMN level INTEGER NOT NULL DEFAULT 1", [])?;
         }
         Ok(Db { conn: Mutex::new(conn) })
     }
@@ -161,7 +161,7 @@ pub struct Track {
     pub missing: bool,
     pub play_count: i64,
     pub last_played_at: Option<f64>,
-    pub categories: String,
+    pub level: i64,
 }
 
 impl Track {
@@ -180,7 +180,7 @@ impl Track {
             missing: row.get::<_, i64>("missing")? != 0,
             play_count: row.get("play_count")?,
             last_played_at: row.get("last_played_at")?,
-            categories: row.get("categories")?,
+            level: row.get("level")?,
         })
     }
 

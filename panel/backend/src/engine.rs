@@ -31,7 +31,7 @@ use serde_json::{json, Map, Value};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use crate::categories::categories_of;
+use crate::levels;
 use crate::db::{self, Db, Track};
 use crate::ffplayout::{truthy, Event, EventLines, FFplayout, FfError};
 use crate::hub::Hub;
@@ -100,8 +100,8 @@ pub struct AutoplaySettings {
     /// shuffle | least_played | in_order
     pub mode: String,
     pub folder: String,
-    /// Any of these; empty means every song.
-    pub categories: Vec<String>,
+    /// Song levels to pick from; empty means every song.
+    pub levels: Vec<i64>,
     pub avoid_repeat: i64,
 }
 
@@ -111,7 +111,7 @@ impl Default for AutoplaySettings {
             enabled: true,
             mode: "shuffle".into(),
             folder: String::new(),
-            categories: Vec::new(),
+            levels: vec![levels::GREAT, levels::GOOD],
             avoid_repeat: 20,
         }
     }
@@ -319,12 +319,12 @@ pub fn track_json(t: &Track) -> Value {
         "duration": t.duration,
         "play_count": t.play_count,
         "last_played_at": t.last_played_at,
-        "categories": categories_of(&t.categories),
+        "level": t.level,
         "thumb": t.has_thumb.then(|| format!("/api/thumbs/{}.jpg?v={}", t.id, t.mtime as i64)),
     })
 }
 
-/// Chooses autoplay tracks.
+/// Chooses autoplay tracks; better-liked songs come up more often.
 struct Picker {
     mode: String,
     pool: Vec<Track>,
@@ -354,12 +354,16 @@ impl Picker {
             if choices.is_empty() {
                 choices = self.pool.iter().collect();
             }
+            let weight = |t: &Track| levels::autoplay_weight(t.level);
             if self.mode == "least_played" {
-                let count = |t: &Track| self.counts.get(&t.id).copied().unwrap_or(0);
-                let fewest = choices.iter().map(|t| count(t)).min().unwrap_or(0);
-                choices.retain(|t| count(t) == fewest);
+                // Plays per weight: an Отлично song is due again after a third as many plays.
+                let due = |t: &Track| self.counts.get(&t.id).copied().unwrap_or(0) as f64 / weight(t);
+                let fewest = choices.iter().map(|t| due(t)).fold(f64::INFINITY, f64::min);
+                choices.retain(|t| due(t) <= fewest + 1e-9);
+                (*choices.choose(&mut rand::rng()).expect("non-empty pool")).clone()
+            } else {
+                (*choices.choose_weighted(&mut rand::rng(), |t| weight(t)).expect("non-empty pool")).clone()
             }
-            (*choices.choose(&mut rand::rng()).expect("non-empty pool")).clone()
         };
         *self.counts.entry(track.id).or_default() += 1;
         track
@@ -379,11 +383,10 @@ fn eligible(conn: &Connection, settings: &AutoplaySettings) -> Result<(HashMap<i
     let tracks: HashMap<i64, Track> =
         db::tracks(conn, "SELECT * FROM tracks WHERE missing = 0", [])?.into_iter().map(|t| (t.id, t)).collect();
     let folder = settings.folder.trim_matches('/');
-    let wanted: HashSet<String> = settings.categories.iter().map(|c| c.to_lowercase()).collect();
     let pool = tracks
         .values()
         .filter(|t| folder.is_empty() || t.folder == folder || t.folder.starts_with(&format!("{folder}/")))
-        .filter(|t| wanted.is_empty() || categories_of(&t.categories).iter().any(|c| wanted.contains(&c.to_lowercase())))
+        .filter(|t| settings.levels.is_empty() || settings.levels.contains(&t.level))
         .cloned()
         .collect();
     Ok((tracks, pool))
@@ -1671,17 +1674,25 @@ impl Engine {
         Ok(())
     }
 
-    /// Song categories were edited: refresh libraries and autoplay picks.
+    /// Song levels changed: refresh libraries and the plan.
     ///
-    /// One song's edit skips the library reload, which would scroll open
-    /// library lists back to the top; that client updates the row itself.
-    pub async fn categories_changed(self: &Arc<Self>, reload_library: bool) -> Result<()> {
-        if reload_library {
-            self.hub.broadcast(&json!({"type": "library"}));
-        }
-        if !self.autoplay_settings().categories.is_empty() {
+    /// Planned autoplay picks stay unless their song may no longer be picked.
+    /// One song's change (`song`: track id and level) skips the library
+    /// reload, which would scroll open library lists back to the top; browsers
+    /// update that row instead, and the plan is only redone if the song is in it.
+    pub async fn levels_changed(self: &Arc<Self>, song: Option<(i64, i64)>) -> Result<()> {
+        let replan = match song {
+            None => {
+                self.hub.broadcast(&json!({"type": "library"}));
+                true
+            }
+            Some((id, level)) => {
+                self.hub.broadcast(&json!({"type": "level", "id": id, "level": level}));
+                self.db.lock().prepare("SELECT 1 FROM upcoming WHERE track_id = ?")?.exists([id])?
+            }
+        };
+        if replan {
             let _guard = self.lock.lock().await;
-            self.db.lock().execute("DELETE FROM upcoming", [])?;
             self.after_change().await?;
         }
         self.broadcast().await;
@@ -2062,6 +2073,33 @@ mod tests {
     }
 
     #[test]
+    fn autoplay_leaves_out_plokho_and_favours_otlichno() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, _library) = library(dir.path());
+        let great = add_track(&db, dir.path(), "great.mp4", 100.0);
+        let good = add_track(&db, dir.path(), "good.mp4", 100.0);
+        let bad = add_track(&db, dir.path(), "bad.mp4", 100.0);
+        let conn = db.lock();
+        conn.execute("UPDATE tracks SET level = ? WHERE id = ?", params![levels::GREAT, great]).unwrap();
+        conn.execute("UPDATE tracks SET level = ? WHERE id = ?", params![levels::BAD, bad]).unwrap();
+
+        let (_, pool) = eligible(&conn, &AutoplaySettings::default()).unwrap();
+        let mut ids: Vec<i64> = pool.iter().map(|t| t.id).collect();
+        ids.sort();
+        assert_eq!(ids, [great, good]);
+        let every = AutoplaySettings { levels: Vec::new(), ..Default::default() };
+        assert_eq!(eligible(&conn, &every).unwrap().1.len(), 3);
+
+        let recent = VecDeque::new();
+        let mut shuffle = Picker::new(pool.clone(), "shuffle", &HashMap::new());
+        let greats = (0..400).filter(|_| shuffle.pick(0, &recent).id == great).count();
+        assert!((240..=360).contains(&greats), "{greats} of 400");
+        let mut least = Picker::new(pool, "least_played", &HashMap::new());
+        let greats = (0..40).filter(|_| least.pick(0, &recent).id == great).count();
+        assert!((28..=32).contains(&greats), "{greats} of 40");
+    }
+
+    #[test]
     fn candidates_skip_missing_files_and_respect_autoplay_off() {
         let dir = tempfile::tempdir().unwrap();
         let (db, library) = library(dir.path());
@@ -2110,6 +2148,9 @@ mod tests {
         let next = merged(&current, &values).unwrap();
         assert_eq!(next.mode, "least_played");
         assert_eq!(next.avoid_repeat, 20);
+        // Settings saved before levels: the old category filter is dropped.
+        let old: AutoplaySettings = serde_json::from_value(json!({"mode": "in_order", "categories": ["Rock"]})).unwrap();
+        assert_eq!((old.mode.as_str(), old.levels), ("in_order", vec![levels::GREAT, levels::GOOD]));
         let stored = json!({"start_seconds": 5});
         let overlay: OverlaySettings = serde_json::from_value(stored).unwrap();
         assert_eq!((overlay.start_seconds, overlay.end_seconds), (5, 20));

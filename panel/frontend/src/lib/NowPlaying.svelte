@@ -1,6 +1,10 @@
 <script>
   import Icon from './Icon.svelte';
+  import LevelPicker from './LevelPicker.svelte';
+  import { api } from './api.js';
+  import { toast } from './toast.svelte.js';
   import { duration, trackName } from './format.js';
+  import { GOOD } from './levels.js';
 
   let { now, next, receivedAt, running, onSkip } = $props();
 
@@ -16,6 +20,22 @@
   );
   let percent = $derived(now?.length ? (position / now.length) * 100 : 0);
   let skipping = $state(false);
+
+  // Shown right away; the next state update confirms it.
+  let picked = $state(null);
+  let level = $derived(picked?.id === track?.id ? picked.level : (track?.level ?? GOOD));
+
+  async function rate(value) {
+    const id = track.id;
+    picked = { id, level: value };
+    try {
+      await api.put(`/api/tracks/${id}/level`, { level: value });
+    } catch (error) {
+      toast(error.message, 'error');
+    }
+    // The state update for the change went out before this answer.
+    if (picked?.id === id && picked.level === value) picked = null;
+  }
 
   async function skip() {
     skipping = true;
@@ -39,6 +59,9 @@
     {#if track}
       <div class="title ellipsis" title={track.title}>{track.title}</div>
       <div class="artist ellipsis">{track.artist || track.path}</div>
+      {#if track.id != null}
+        <div class="rate"><LevelPicker small value={level} onPick={rate} /></div>
+      {/if}
     {:else if now?.kind === 'placeholder'}
       <div class="title">Placeholder on air</div>
       <div class="artist">ffplayout is sending black and silence. Queue something or turn on autoplay.</div>
@@ -109,6 +132,10 @@
   .artist {
     color: var(--muted);
     font-size: 15px;
+  }
+
+  .rate {
+    margin-top: 8px;
   }
 
   .progress {
