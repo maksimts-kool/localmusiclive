@@ -2,11 +2,8 @@
 /media/*
 !/media/.gitkeep
 
-# Python
-__pycache__/
-*.pyc
-.venv/
-.pytest_cache/
+# Rust
+panel/backend/target/
 
 # Frontend
 node_modules/

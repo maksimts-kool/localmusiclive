@@ -7,7 +7,7 @@ streaming; a small control panel owns the queue: drag to reorder, skip,
 autoplay when the queue runs dry, and a "Now · Next" lower third on the stream.
 
 ```
- browser ──WebSocket──▶ panel (FastAPI + Svelte, :8080) ──REST──▶ ffplayout (:8787) ──HLS──▶ watch (nginx, :8090) ──▶ TV
+ browser ──WebSocket──▶ panel (Rust + Svelte, :8080) ──REST──▶ ffplayout (:8787) ──HLS──▶ watch (nginx, :8090) ──▶ TV
                             ▲          SQLite in /data               │
                             └──────── server-sent events ────────────┘
                      both read the clips from ./media (mounted at /media)
@@ -214,8 +214,8 @@ the current song is never interrupted.
 - **Login renewal**: the panel logs in to ffplayout's API and renews its token
   before it expires (and logs in again if it has to).
 
-The core of this is `panel/backend/app/timeline.py` (with tests) and
-`panel/backend/app/engine.py`.
+The core of this is `panel/backend/src/timeline.rs` (with tests) and
+`panel/backend/src/engine.rs`.
 
 ## Notes and limits
 
@@ -233,8 +233,8 @@ The core of this is `panel/backend/app/timeline.py` (with tests) and
 ## Development
 
 ```bash
-# backend tests
-cd panel/backend && python3 -m pytest tests
+# backend tests (Rust; no toolchain needed on the Mac)
+docker run --rm -v "$PWD/panel/backend":/src -w /src rust:1-bookworm cargo test
 # frontend with hot reload, against a panel on localhost:8080
 cd panel/frontend && npm install && npm run dev
 ```

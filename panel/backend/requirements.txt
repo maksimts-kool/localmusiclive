@@ -1,9 +1,0 @@
-fastapi==0.143.5
-uvicorn[standard]==0.54.0
-httpx==0.28.1
-pillow==13.0.0
-tzdata
-# Unpinned on purpose: YouTube changes often, and the panel also updates it at
-# start-up (YTDLP_AUTO_UPDATE). The deno extra provides the JavaScript runtime
-# yt-dlp needs for YouTube.
-yt-dlp[default,deno]
