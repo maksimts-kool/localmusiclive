@@ -1,6 +1,7 @@
 //! localmusiclive panel: owns the queue and keeps ffplayout's playlists, the
 //! on-screen song card and the browsers in step with it.
 
+mod ads;
 mod api;
 mod db;
 mod discover;
@@ -9,6 +10,7 @@ mod ffplayout;
 mod hub;
 mod levels;
 mod library;
+mod logos;
 mod overlay;
 mod raster;
 mod settings;
@@ -24,6 +26,7 @@ use std::time::Duration;
 use anyhow::Result;
 use tracing_subscriber::EnvFilter;
 
+use crate::ads::Ads;
 use crate::db::Db;
 use crate::engine::Engine;
 use crate::ffplayout::FFplayout;
@@ -74,14 +77,22 @@ async fn main() -> Result<()> {
     let ff = Arc::new(FFplayout::new(&s.ffplayout_url, &s.ffplayout_user, &s.ffplayout_password, s.channel_id));
     let library = Arc::new(Library::new(db.clone(), s.clone()));
     let hub = Hub::default();
-    let engine = Arc::new(Engine::new(s.clone(), db.clone(), ff, library.clone(), hub.clone()));
+    let ads = Arc::new(Ads::new(s.clone()));
+    let engine = Arc::new(Engine::new(s.clone(), db.clone(), ff, library.clone(), ads, hub.clone()));
     let youtube = Arc::new(YouTube::new(s.clone(), db.clone(), library.clone(), engine.clone(), hub.clone()));
     engine.set_downloads(&youtube);
 
     engine.start();
     {
         let youtube = youtube.clone();
-        tokio::spawn(async move { youtube.start().await });
+        let engine = engine.clone();
+        tokio::spawn(async move {
+            // Commercials are downloaded with yt-dlp, so after its update.
+            youtube.start().await;
+            if engine.ad_settings().enabled {
+                engine.fetch_ads();
+            }
+        });
     }
 
     let app = api::router(api::App { s: s.clone(), db, library, engine: engine.clone(), youtube, hub });

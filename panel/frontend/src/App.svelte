@@ -170,6 +170,7 @@
   <Settings
     autoplay={data.autoplay}
     overlay={data.overlay}
+    ads={data.ads}
     resolution={status?.resolution}
     onClose={() => (settingsOpen = false)}
   />

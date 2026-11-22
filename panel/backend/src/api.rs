@@ -217,6 +217,7 @@ pub fn router(app: App) -> Router {
         .route("/api/playout/{command}", post(playout))
         .route("/api/settings/autoplay", put(put_autoplay))
         .route("/api/settings/overlay", put(put_overlay))
+        .route("/api/settings/ads", put(put_ads))
         .route("/api/overlay/preview", post(overlay_preview))
         .route("/api/history", get(history))
         .with_state(app);
@@ -539,6 +540,18 @@ fn autoplay_rules() -> Vec<(&'static str, Rule)> {
     ]
 }
 
+fn ads_rules() -> Vec<(&'static str, Rule)> {
+    vec![
+        ("enabled", Rule::Bool),
+        ("every", Rule::Int(1, 100)),
+        ("per_break", Rule::Int(1, 10)),
+        ("advertunes", Rule::Bool),
+        ("keep", Rule::Int(1, 300)),
+        ("prefer_channels", Rule::Bool),
+        ("new_only", Rule::Bool),
+    ]
+}
+
 fn overlay_rules() -> Vec<(&'static str, Rule)> {
     vec![
         ("enabled", Rule::Bool),
@@ -580,6 +593,12 @@ async fn put_autoplay(State(app): State<App>, body: Bytes) -> ApiResult {
     Ok(Json(serde_json::to_value(app.engine.autoplay_settings()).map_err(anyhow::Error::from)?))
 }
 
+async fn put_ads(State(app): State<App>, body: Bytes) -> ApiResult {
+    let values = clean(&parse_body(&body)?, &ads_rules())?;
+    app.engine.set_ads(&values).await?;
+    Ok(Json(serde_json::to_value(app.engine.ad_settings()).map_err(anyhow::Error::from)?))
+}
+
 async fn put_overlay(State(app): State<App>, body: Bytes) -> ApiResult {
     let values = clean(&parse_body(&body)?, &overlay_rules())?;
     app.engine.set_overlay(&values).await?;
@@ -607,7 +626,7 @@ async fn history(State(app): State<App>, Query(q): Query<HashMap<String, String>
     let mut stmt = conn.prepare(
         "SELECT history.*, tracks.artist, tracks.title FROM history \
          LEFT JOIN tracks ON tracks.id = history.track_id \
-         ORDER BY history.id DESC LIMIT ? OFFSET ?",
+         WHERE history.kind != 'ad' ORDER BY history.id DESC LIMIT ? OFFSET ?",
     )?;
     let rows: Vec<Value> = stmt.query_map([limit, offset], db::row_json)?.collect::<rusqlite::Result<_>>()?;
     Ok(Json(json!(rows)))

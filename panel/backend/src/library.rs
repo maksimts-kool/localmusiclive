@@ -31,7 +31,7 @@ impl ScanResult {
 }
 
 /// Every video file below `root` (relative path → size, mtime).
-fn walk(root: &Path) -> HashMap<String, (i64, f64)> {
+pub fn walk(root: &Path) -> HashMap<String, (i64, f64)> {
     let mut found = HashMap::new();
     let mut stack = vec![(root.to_path_buf(), String::new())];
     while let Some((dir, rel_dir)) = stack.pop() {

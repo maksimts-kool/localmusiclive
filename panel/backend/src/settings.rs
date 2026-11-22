@@ -3,8 +3,9 @@ use std::path::PathBuf;
 
 pub const VIDEO_EXTENSIONS: &[&str] = &[".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi", ".ts", ".flv"];
 /// Top-level folders in /media that are not part of the library. ffplayout's
-/// default filler lives in filler/.
-pub const IGNORED_FOLDERS: &[&str] = &["filler", "00-assets"];
+/// default filler lives in filler/, ad breaks play from ads/.
+pub const IGNORED_FOLDERS: &[&str] = &["filler", "00-assets", ADS_FOLDER];
+pub const ADS_FOLDER: &str = "ads";
 
 #[derive(Clone, Debug)]
 pub struct Settings {
@@ -100,6 +101,10 @@ impl Settings {
 
     pub fn download_dir(&self) -> PathBuf {
         self.media_root.join("youtube")
+    }
+
+    pub fn ads_dir(&self) -> PathBuf {
+        self.media_root.join(ADS_FOLDER)
     }
 
     pub fn cookies_file(&self) -> PathBuf {

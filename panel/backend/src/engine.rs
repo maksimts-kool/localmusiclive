@@ -31,6 +31,7 @@ use serde_json::{json, Map, Value};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
+use crate::ads::{AdSettings, Ads, BreakState, WithAds};
 use crate::levels;
 use crate::db::{self, Db, Track};
 use crate::ffplayout::{truthy, Event, EventLines, FFplayout, FfError};
@@ -121,6 +122,10 @@ fn autoplay_from(conn: &Connection) -> AutoplaySettings {
     db::setting(conn, "autoplay").and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default()
 }
 
+fn ads_from(conn: &Connection) -> AdSettings {
+    db::setting(conn, "ads").and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default()
+}
+
 fn overlay_from(conn: &Connection) -> OverlaySettings {
     db::setting(conn, "overlay").and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default()
 }
@@ -182,6 +187,19 @@ fn following(plan: &Plan, managed: bool) -> impl Iterator<Item = &Slot> {
 
 fn next_slot(plan: Option<&Plan>, managed: bool) -> Option<Slot> {
     following(plan?, managed).find(|s| !s.is_gap() && s.part == 0).cloned()
+}
+
+/// The first song (not an ad) after the clip on air, and how long after
+/// `remaining` (what is left of the clip on air today) it starts.
+fn next_song(plan: Option<&Plan>, managed: bool, remaining: f64) -> Option<(Slot, f64)> {
+    let mut at = remaining;
+    for slot in following(plan?, managed) {
+        if !slot.is_gap() && slot.part == 0 && !slot.is_ad() {
+            return Some((slot.clone(), at));
+        }
+        at += slot.length();
+    }
+    None
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -558,6 +576,7 @@ pub struct Engine {
     db: Arc<Db>,
     ff: Arc<FFplayout>,
     library: Arc<Library>,
+    ads: Arc<Ads>,
     hub: Hub,
     tz: Tz,
     lock: tokio::sync::Mutex<()>,
@@ -570,7 +589,14 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn new(s: Arc<Settings>, db: Arc<Db>, ff: Arc<FFplayout>, library: Arc<Library>, hub: Hub) -> Engine {
+    pub fn new(
+        s: Arc<Settings>,
+        db: Arc<Db>,
+        ff: Arc<FFplayout>,
+        library: Arc<Library>,
+        ads: Arc<Ads>,
+        hub: Hub,
+    ) -> Engine {
         let tz = s.timezone.parse::<Tz>().unwrap_or_else(|_| {
             tracing::warn!("Unknown time zone {:?}; using UTC", s.timezone);
             Tz::UTC
@@ -580,6 +606,7 @@ impl Engine {
             db,
             ff,
             library,
+            ads,
             hub,
             tz,
             lock: tokio::sync::Mutex::new(()),
@@ -674,6 +701,10 @@ impl Engine {
 
     pub fn autoplay_settings(&self) -> AutoplaySettings {
         autoplay_from(&self.db.lock())
+    }
+
+    pub fn ad_settings(&self) -> AdSettings {
+        ads_from(&self.db.lock())
     }
 
     pub fn overlay_settings(&self) -> OverlaySettings {
@@ -1135,10 +1166,12 @@ impl Engine {
     /// Lays out today after `prefix` and all of tomorrow, picking autoplay songs as needed.
     fn layout_from(&self, prefix: Vec<Slot>) -> Result<(Vec<Slot>, Vec<Slot>)> {
         let settings = self.autoplay_settings();
+        let ads = self.ads.list();
         let conn = self.db.lock();
         db::tx(&conn, |conn| {
             let mut candidates = Candidates::new(conn, &self.library, &settings)?;
-            let result = layout(prefix, &mut candidates);
+            let breaks = BreakState::from_history(conn)?;
+            let result = layout(prefix, WithAds::new(&mut candidates, &ads_from(conn), ads, breaks));
             match candidates.error.take() {
                 Some(err) => Err(err),
                 None => Ok(result),
@@ -1284,28 +1317,32 @@ impl Engine {
         db::track(&self.db.lock(), track_id?).ok().flatten()
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// The card for `phase`: "now", "next" or "ad" (shown all through an ad,
+    /// with the song after the break). `next` is the next song, the seconds
+    /// until it starts and whether ads play before it.
     fn card_for(
         &self,
         phase: &str,
         opacity: f64,
         position: f64,
-        until_next: Option<f64>,
         length: f64,
         now_slot: Option<&Slot>,
-        next_slot: Option<&Slot>,
+        next: Option<(&Slot, f64, bool)>,
     ) -> Option<Card> {
-        let slot = if phase == "next" { next_slot } else { now_slot }?;
-        let track = self.track(slot.track_id);
-        let (status, time_left) = if phase == "next" {
-            ("Начнётся через {time}", until_next.unwrap_or(0.0))
-        } else if let Some(until) = until_next {
-            ("Следующая песня через {time}", until)
-        } else {
-            ("Осталось {time}", length - position)
+        const AFTER_ADS: &str = "После рекламы через {time}";
+        let (slot, heading, status, time_left) = match (phase, next) {
+            ("ad", Some((song, until, _))) => (song, "Реклама", AFTER_ADS, until),
+            ("ad", None) => (now_slot?, "Реклама", "Осталось {time}", length - position),
+            ("next", Some((song, until, ads))) => {
+                (song, "Далее", if ads { AFTER_ADS } else { "Начнётся через {time}" }, until)
+            }
+            ("next", None) => return None,
+            (_, Some((_, until, _))) => (now_slot?, "Сейчас играет", "Следующая песня через {time}", until),
+            (_, None) => (now_slot?, "Сейчас играет", "Осталось {time}", length - position),
         };
+        let track = self.track(slot.track_id);
         Some(Card {
-            heading: if phase == "next" { "Далее" } else { "Сейчас играет" }.into(),
+            heading: heading.into(),
             title: track.as_ref().map(|t| t.title.clone()).unwrap_or_else(|| slot.title.clone()),
             artist: track.as_ref().map(|t| t.artist.clone()).unwrap_or_default(),
             status: status.into(),
@@ -1328,6 +1365,10 @@ impl Engine {
             }
             if slot.is_gap() {
                 offset += slot.length();
+                continue;
+            }
+            if slot.is_ad() {
+                offset += slot.end() - slot.seek;
                 continue;
             }
             if slot.kind != "queue" {
@@ -1374,13 +1415,18 @@ impl Engine {
         let length = slot.end();
         let nxt = next_slot(plan, true);
         let until_next = nxt.as_ref().map(|_| length - position);
-        let card = card_phase(position, until_next, s).and_then(|(phase, opacity)| {
-            self.card_for(phase, opacity, position, until_next, length, Some(&slot), nxt.as_ref())
-        });
+        let song = next_song(plan, true, slot.out - position);
+        let next = song.as_ref().map(|(song, at)| (song, *at, nxt.as_ref().is_some_and(Slot::is_ad)));
+        let card = if slot.is_ad() {
+            s.enabled.then(|| self.card_for("ad", 1.0, position, length, Some(&slot), next)).flatten()
+        } else {
+            card_phase(position, until_next, s)
+                .and_then(|(phase, opacity)| self.card_for(phase, opacity, position, length, Some(&slot), next))
+        };
         let queued = Self::queued_slots(plan, true);
 
         let opacity = line_opacity(position, until_next, length, s);
-        let line = (opacity > 0.0 && length > 0.0).then(|| {
+        let line = (!slot.is_ad() && opacity > 0.0 && length > 0.0).then(|| {
             let lengths = std::iter::once(length)
                 .chain(queued.iter().take(LINE_MAX_QUEUED).map(|(q, _)| q.end() - q.seek))
                 .collect();
@@ -1433,14 +1479,14 @@ impl Engine {
             let line = Line { lengths, position: 64.0, opacity: 1.0 };
             overlay::compose(None, Some(&line), s, size, queue.as_ref())
         } else {
-            let now_slot = cur.as_ref().filter(|_| managed).and_then(|c| c.slot.clone());
-            let nxt = next_slot(plan.as_deref(), managed);
+            let now_slot = cur.as_ref().filter(|_| managed).and_then(|c| c.slot.clone()).filter(|s| !s.is_ad());
+            let nxt = next_song(plan.as_deref(), managed, 0.0).map(|(song, _)| song);
             let sample = Slot { title: "Исполнитель – Название песни".into(), ..Slot::new("auto", "", 0.0, 212.0, 212.0) };
             let shown_now = now_slot.clone().unwrap_or_else(|| sample.clone());
             let shown_next = nxt.or(now_slot).unwrap_or(sample);
             let card = s
                 .enabled
-                .then(|| self.card_for(phase, 1.0, 64.0, Some(148.0), 212.0, Some(&shown_now), Some(&shown_next)))
+                .then(|| self.card_for(phase, 1.0, 64.0, 212.0, Some(&shown_now), Some((&shown_next, 148.0, false))))
                 .flatten();
             overlay::compose(card.as_ref(), None, s, size, queue.as_ref())
         };
@@ -1699,6 +1745,46 @@ impl Engine {
         Ok(())
     }
 
+    pub async fn set_ads(self: &Arc<Self>, values: &Map<String, Value>) -> Result<()> {
+        let settings = {
+            let _guard = self.lock.lock().await;
+            let settings = merged(&self.ad_settings(), values)?;
+            self.db.set_setting("ads", &serde_json::to_value(&settings)?)?;
+            self.after_change().await?;
+            settings
+        };
+        if settings.enabled {
+            self.fetch_ads();
+        }
+        self.broadcast().await;
+        Ok(())
+    }
+
+    /// In the background: brings the commercials from advertunes.ru up to
+    /// date if they are turned on, then reads the ads folder again.
+    pub fn fetch_ads(self: &Arc<Self>) {
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            let settings = this.ad_settings();
+            if settings.advertunes {
+                match this.ads.fetch_advertunes(&settings).await {
+                    Ok((0, 0)) => {}
+                    Ok((added, removed)) => {
+                        tracing::info!("advertunes.ru: {added} new commercials, {removed} older ones removed")
+                    }
+                    Err(err) => tracing::warn!("Could not update the commercials from advertunes.ru: {err:#}"),
+                }
+            }
+            if this.ads.scan().await {
+                let _guard = this.lock.lock().await;
+                if let Err(err) = this.after_change().await {
+                    tracing::error!("Could not plan the new ads: {err:#}");
+                }
+            }
+            this.broadcast().await;
+        });
+    }
+
     pub async fn set_overlay(self: &Arc<Self>, values: &Map<String, Value>) -> Result<()> {
         {
             let _guard = self.lock.lock().await;
@@ -1724,8 +1810,11 @@ impl Engine {
 
     pub async fn rescan(self: &Arc<Self>) -> Result<()> {
         let result = self.library.scan().await?;
+        let ads_changed = self.ads.scan().await;
         if result.changed() {
             self.hub.broadcast(&json!({"type": "library"}));
+        }
+        if result.changed() || ads_changed {
             {
                 let _guard = self.lock.lock().await;
                 self.after_change().await?;
@@ -1761,6 +1850,10 @@ impl Engine {
                 }
                 if tick % 360 == 0 {
                     self.prune_plans()?;
+                }
+                // New commercials, once a day.
+                if tick % 8640 == 0 && self.ad_settings().enabled {
+                    self.fetch_ads();
                 }
                 self.broadcast().await;
                 Ok(())
@@ -1815,7 +1908,7 @@ impl Engine {
         let history_rows: Vec<HistoryRow> = {
             let mut stmt = conn.prepare(
                 "SELECT id, track_id, kind, started_at, ended_at, skipped, requested_by \
-                 FROM history ORDER BY id DESC LIMIT 30",
+                 FROM history WHERE kind != 'ad' ORDER BY id DESC LIMIT 30",
             )?;
             let rows = stmt.query_map([], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get::<_, i64>(5)? != 0, r.get(6)?))
@@ -1846,6 +1939,7 @@ impl Engine {
                 json!({
                     "track": tj(slot.track_id),
                     "kind": slot.kind,
+                    "title": slot.title,
                     "position": slot.seek + elapsed,
                     "length": slot.full_out.unwrap_or(slot.duration),
                     "remaining": remaining,
@@ -1890,6 +1984,9 @@ impl Engine {
             })
             .collect();
         let library_size: i64 = conn.query_row("SELECT COUNT(*) FROM tracks WHERE missing = 0", [], |r| r.get(0))?;
+        let mut ads = serde_json::to_value(ads_from(&conn))?;
+        ads["clips"] = json!(self.ads.list().len());
+        ads["fetching"] = json!(self.ads.fetching());
 
         Ok(json!({
             "server_time": t,
@@ -1906,7 +2003,7 @@ impl Engine {
                 "library_size": library_size,
             },
             "now": now_playing,
-            "next": nxt.map(|n| json!({"track": tj(n.track_id), "kind": n.kind})),
+            "next": nxt.map(|n| json!({"track": tj(n.track_id), "kind": n.kind, "title": n.title})),
             "queue": queue_rows.iter().map(|r| json!({
                 "id": r.0,
                 "track": tj(Some(r.1)),
@@ -1917,6 +2014,7 @@ impl Engine {
             "history": history,
             "autoplay": autoplay_from(&conn),
             "overlay": overlay_from(&conn),
+            "ads": ads,
             "downloads": downloads,
         }))
     }
@@ -2114,12 +2212,28 @@ mod tests {
     }
 
     #[test]
+    fn ad_breaks_continue_from_the_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, _) = library(dir.path());
+        let conn = db.lock();
+        let add = |kind: &str| conn.execute("INSERT INTO history (kind, started_at) VALUES (?, 0)", [kind]).unwrap();
+        assert_eq!(BreakState::from_history(&conn).unwrap(), BreakState::default());
+        for kind in ["auto", "ad", "ad", "queue", "auto"] {
+            add(kind);
+        }
+        assert_eq!(BreakState::from_history(&conn).unwrap(), BreakState { songs_since: 2, in_break: 0, played: 2 });
+        add("ad");
+        assert_eq!(BreakState::from_history(&conn).unwrap(), BreakState { songs_since: 0, in_break: 1, played: 3 });
+    }
+
+    #[test]
     fn caches_stay_bounded() {
         let dir = tempfile::tempdir().unwrap();
         let (db, library) = library(dir.path());
         let s = Arc::new(Settings { media_root: dir.path().to_path_buf(), ..Settings::from_env() });
         let ff = Arc::new(FFplayout::new("http://127.0.0.1:9", "", "", 1));
-        let engine = Engine::new(s, db.clone(), ff, Arc::new(library), Hub::default());
+        let ads = Arc::new(Ads::new(s.clone()));
+        let engine = Engine::new(s, db.clone(), ff, Arc::new(library), ads, Hub::default());
         // Many versions of one day, each loaded once: storage and cache keep the newest.
         for i in 0..30 {
             let slots = vec![gap(100.0 + i as f64)];

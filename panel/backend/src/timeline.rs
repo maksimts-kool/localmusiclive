@@ -24,7 +24,7 @@ pub fn r3(value: f64) -> f64 {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Slot {
-    /// "gap" | "queue" | "auto"
+    /// "gap" | "queue" | "auto" | "ad"
     pub kind: String,
     /// What ffplayout plays; "" makes ffplayout generate black/silence.
     pub path: String,
@@ -78,6 +78,10 @@ impl Slot {
 
     pub fn is_gap(&self) -> bool {
         self.kind == "gap"
+    }
+
+    pub fn is_ad(&self) -> bool {
+        self.kind == "ad"
     }
 
     pub fn to_media(&self) -> Value {

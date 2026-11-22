@@ -25,6 +25,7 @@
 - **Song ratings:** autoplay favours your best songs and never plays the bad ones
 - **On-screen card:** "Now playing" / "Up next" with a countdown, fully customizable
 - **YouTube:** search, download and queue in one click
+- **Ad breaks:** optional breaks every few songs, with videos from `media/ads/` (the panel can keep it filled with the newest commercials from [advertunes.ru](https://advertunes.ru), Первый канал and Россия 1 first)
 - **Watch anywhere at home:** TV browser, IPTV app or VLC, with no streaming platform in between
 
 <p align="center">

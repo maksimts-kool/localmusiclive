@@ -5,12 +5,13 @@
   import { attempt } from './toast.svelte.js';
   import { LEVELS } from './levels.js';
 
-  let { autoplay, overlay, resolution = [1280, 720], onClose } = $props();
+  let { autoplay, overlay, ads, resolution = [1280, 720], onClose } = $props();
 
   // Edit copies of the settings at the time the dialog opened; saved explicitly.
   let ap = $state(untrack(() => ({ ...autoplay, levels: [...(autoplay.levels ?? [2, 1])] })));
   let counts = $state({});
   let ov = $state(untrack(() => ({ ...overlay })));
+  let ad = $state(untrack(() => ({ enabled: false, every: 3, per_break: 1, advertunes: true, keep: 30, prefer_channels: true, new_only: true, ...ads })));
   let folders = $state([]);
   let dialog;
 
@@ -94,6 +95,24 @@
     if (ok) onClose();
   }
 
+  async function saveAds() {
+    const { enabled, every, per_break, advertunes, keep, prefer_channels, new_only } = ad;
+    const ok = await attempt(
+      () =>
+        api.put('/api/settings/ads', {
+          enabled,
+          advertunes,
+          prefer_channels,
+          new_only,
+          every: Number(every),
+          per_break: Number(per_break),
+          keep: Number(keep),
+        }),
+      'Ad breaks saved',
+    );
+    if (ok) onClose();
+  }
+
   async function saveOverlay() {
     const ok = await attempt(() => api.put('/api/settings/overlay', numbers(ov)), 'Song card updated');
     if (ok) onClose();
@@ -148,6 +167,54 @@
       </label>
     </div>
     <div class="row-end"><button class="btn primary" onclick={saveAutoplay}>Save autoplay</button></div>
+  </section>
+
+  <section>
+    <h3 class="section-title">Ad breaks</h3>
+    <p class="muted hint">
+      Plays the videos in <code>media/ads/</code> between songs, queued ones included. While an ad
+      is on, the card says «Реклама» and counts down to the next song. Ads longer than a minute
+      are never played or downloaded. Commercials from
+      advertunes.ru are checked once a day; older ones it downloaded are removed to keep the
+      number you set. The channel is told by its logo in the recording; other channels only
+      make up the number when there aren't enough from Первый and Россия 1.
+    </p>
+    <div class="grid">
+      <label class="check"><input type="checkbox" bind:checked={ad.enabled} /> Play ad breaks</label>
+      <label class="check">
+        <input type="checkbox" bind:checked={ad.advertunes} disabled={!ad.enabled} /> Download commercials from advertunes.ru
+      </label>
+      <label class="check">
+        <input type="checkbox" bind:checked={ad.prefer_channels} disabled={!ad.enabled || !ad.advertunes} />
+        Первый канал and Россия 1 first
+      </label>
+      <label class="check">
+        <input type="checkbox" bind:checked={ad.new_only} disabled={!ad.enabled || !ad.advertunes} />
+        Only new commercials (this year and last)
+      </label>
+      <label>
+        <span>A break after every (songs)</span>
+        <input type="number" min="1" max="100" bind:value={ad.every} disabled={!ad.enabled} />
+      </label>
+      <label>
+        <span>Ads per break</span>
+        <input type="number" min="1" max="10" bind:value={ad.per_break} disabled={!ad.enabled} />
+      </label>
+      <label>
+        <span>Keep the newest (commercials)</span>
+        <input type="number" min="1" max="300" bind:value={ad.keep} disabled={!ad.enabled || !ad.advertunes} />
+      </label>
+      <span class="wide muted small">
+        {#if ads?.fetching}
+          Downloading commercials from advertunes.ru…
+        {:else if ads?.clips}
+          {ads.clips} {ads.clips === 1 ? 'ad' : 'ads'} in the folder.
+        {:else}
+          No ads in the folder yet{ad.advertunes ? '; commercials are downloaded when you save' : ''}.
+        {/if}
+      </span>
+    </div>
+    <div class="row-end"><button class="btn primary" onclick={saveAds}>Save ad breaks</button></div>
   </section>
 
   <section>

@@ -54,6 +54,7 @@
       <h2 class="section-title">Now playing</h2>
       {#if now?.kind === 'queue'}<span class="badge queue">Queued</span>{/if}
       {#if now?.kind === 'auto'}<span class="badge">Autoplay</span>{/if}
+      {#if now?.kind === 'ad'}<span class="badge">Ad break</span>{/if}
     </div>
 
     {#if track}
@@ -62,6 +63,9 @@
       {#if track.id != null}
         <div class="rate"><LevelPicker small value={level} onPick={rate} /></div>
       {/if}
+    {:else if now?.kind === 'ad'}
+      <div class="title">Ad break</div>
+      <div class="artist ellipsis">{now.title}</div>
     {:else if now?.kind === 'placeholder'}
       <div class="title">Placeholder on air</div>
       <div class="artist">ffplayout is sending black and silence. Queue something or turn on autoplay.</div>
@@ -72,11 +76,11 @@
       <div class="artist">Press Start to go on air.</div>
     {/if}
 
-    <div class="progress" aria-hidden={!track}>
+    <div class="progress" aria-hidden={!track && now?.kind !== 'ad'}>
       <div class="bar"><div class="fill" style:width="{percent}%"></div></div>
       <div class="times">
         <span>{duration(position)}</span>
-        <span>{track ? `−${duration(now.length - position)}` : ''}</span>
+        <span>{track || now?.kind === 'ad' ? `−${duration(now.length - position)}` : ''}</span>
       </div>
     </div>
 
@@ -84,10 +88,10 @@
       <button class="btn primary" onclick={skip} disabled={!running || !now || skipping}>
         <Icon name="skip" size={16} /> Skip
       </button>
-      {#if next?.track}
+      {#if next?.track || next?.kind === 'ad'}
         <div class="next ellipsis">
           <span class="muted">Next</span>
-          {trackName(next.track)}
+          {next.kind === 'ad' ? 'Ad break' : trackName(next.track)}
         </div>
       {/if}
     </div>
