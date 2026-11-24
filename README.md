@@ -6,7 +6,7 @@
   <img alt="Docker" src="https://img.shields.io/badge/Docker-Compose-ff5f6d?style=for-the-badge&logo=docker&logoColor=white&labelColor=14121f">
   <img alt="Rust" src="https://img.shields.io/badge/Rust-axum-ff8a6a?style=for-the-badge&logo=rust&logoColor=white&labelColor=14121f">
   <img alt="Svelte" src="https://img.shields.io/badge/Svelte-5-ffa86e?style=for-the-badge&logo=svelte&logoColor=white&labelColor=14121f">
-  <img alt="ffplayout" src="https://img.shields.io/badge/ffplayout-2.9-ffc371?style=for-the-badge&logo=ffmpeg&logoColor=white&labelColor=14121f">
+  <img alt="ffplayout" src="https://img.shields.io/badge/ffplayout-latest-ffc371?style=for-the-badge&logo=ffmpeg&logoColor=white&labelColor=14121f">
 </p>
 
 <p align="center">

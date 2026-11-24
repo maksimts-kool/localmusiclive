@@ -9,7 +9,7 @@
 # Version: the latest ffplayout release, looked up on every build. Set
 # FFPLAYOUT_VERSION (e.g. 2.9.0) to build a specific one instead. If a new
 # release breaks the patch, the build stops at `git apply`: port the LiveLogo
-# watcher in crates/engine/src/graphics/program.rs to it, or set
+# watcher in crates/engine/src/graphics/program.rs and source.rs to it, or set
 # FFPLAYOUT_VERSION to the last release that worked.
 ARG FFPLAYOUT_VERSION=
 
@@ -62,12 +62,17 @@ COPY --from=source /src /src
 WORKDIR /src
 # Faster than the upstream release profile (fat LTO, one codegen unit), and
 # the difference doesn't matter for one channel.
+# The web UI is built here rather than by ffplayout's build.rs: with the cargo
+# cache below, build.rs may not run again for a fresh source tree, which then
+# has no UI to embed.
 ENV CARGO_PROFILE_RELEASE_LTO=thin \
-    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
+    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+    FFPLAYOUT_FRONTEND_PREBUILT=1
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     --mount=type=cache,target=/root/.npm \
-    cargo build --release --package ffplayout --no-default-features --features embed_frontend \
+    npm ci && npm run build-only \
+    && cargo build --release --package ffplayout --no-default-features --features embed_frontend \
     && cp target/release/ffplayout /usr/local/bin/ffplayout
 
 FROM debian:trixie-slim
@@ -88,9 +93,15 @@ COPY --from=source /src/assets/logo.png /src/assets/dummy.vtt /usr/share/ffplayo
 RUN mkdir -p /usr/share/ffplayout/db /var/log/ffplayout && ffplayout --version
 
 # DB is read by ffplayout from the environment (--db).
+# glibc malloc: few per-thread arenas, and buffers of 1 MB or more always go
+# straight back to the system when freed. The song card is decoded about ten
+# times a second on one thread and freed on another; without this, memory
+# grows by ~30 MB a minute and playout gets slower over time.
 ENV DB=/config/ffplayout.db \
     LISTEN=0.0.0.0:8787 \
-    LOG_TO_CONSOLE=true
+    LOG_TO_CONSOLE=true \
+    MALLOC_ARENA_MAX=2 \
+    MALLOC_MMAP_THRESHOLD_=1048576
 
 VOLUME ["/config", "/playlists", "/media"]
 EXPOSE 8787

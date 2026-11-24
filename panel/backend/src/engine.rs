@@ -930,6 +930,10 @@ impl Engine {
             let latest = rx.borrow_and_update().clone();
             let Some((received, incoming)) = latest else { continue };
             let result = match incoming {
+                // ffplayout 2.9 sends {"running": false, ...}; older versions the text.
+                Incoming::Event(event) if event.get("running") == Some(&Value::Bool(false)) => {
+                    self.on_stopped(false).await
+                }
                 Incoming::Event(event) => self.on_event(&event, received).await,
                 Incoming::Text(text) if text == "not running" => self.on_stopped(false).await,
                 Incoming::Text(_) => Ok(()),

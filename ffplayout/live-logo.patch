@@ -1,55 +1,80 @@
 diff --git a/crates/engine/src/graphics/program.rs b/crates/engine/src/graphics/program.rs
-index a5f91d89..5af572ed 100644
+index a5f91d89..8fec1ffa 100644
 --- a/crates/engine/src/graphics/program.rs
 +++ b/crates/engine/src/graphics/program.rs
-@@ -1,8 +1,17 @@
+@@ -1,8 +1,19 @@
  //! Select immutable graphics on the final program timeline before fan-out.
 -use std::sync::Arc;
 +use std::{
 +    fs,
++    path::Path,
 +    sync::{
-+        Arc,
-+        atomic::{AtomicBool, Ordering},
++        Arc, Mutex, PoisonError,
++        atomic::{AtomicBool, AtomicU64, Ordering},
 +    },
 +    thread,
 +    time::{Duration, SystemTime},
 +};
  
- use anyhow::Result;
+-use anyhow::Result;
++use anyhow::{Context, Result, ensure};
++use ff_graphics::{ffmpeg::logo::LogoOverlay as PreparedLogoOverlay, style::LogoStyle};
  use ffmpeg_next::{Rational, Rescale, frame};
 +use log::debug;
  
  use crate::{
      clock::SharedPlayoutClock,
-@@ -24,6 +33,75 @@ use super::{
+@@ -11,19 +22,127 @@ use crate::{
+     output::FrameOutput,
+     playout::Timeline,
+     utils::{
+-        config::OutputConfig,
++        config::{LogoConfig, OutputConfig},
+         ffmpeg::{make_video_frame_writable, reference_video_frame},
++        helper::open_media_input,
+     },
+ };
+ 
+ use super::{
+     clip::{ClipGraphics, ClipSceneFrame},
+     frame::{GraphicsCache, GraphicsFrame},
++    logo_adapter::LogoOverlay,
+     logo_control::LogoControl,
+     manual::ManualGraphics,
      source::ProgramGraphicsState,
  };
  
 +/// How often to look at the logo file; about once a frame at 30 fps, so a
 +/// picture another program animates comes through at full frame rate.
 +const LIVE_LOGO_CHECK: Duration = Duration::from_millis(15);
++static LIVE_LOGO_IDS: AtomicU64 = AtomicU64::new(0);
 +
-+/// Reloads the logo when its file changes, so another program can update the
-+/// picture while a clip plays (localmusiclive patch: on-screen song cards).
-+/// Writers should replace the file atomically (write elsewhere, then rename).
++/// Shows changes to the logo file while a clip plays, so another program can
++/// update the picture (localmusiclive patch: on-screen song cards). Writers
++/// should replace the file atomically (write elsewhere, then rename).
 +///
-+/// The check runs on its own thread and hands changes to the channel's logo
-+/// control, which prepares the new picture off the video thread and swaps it
-+/// in, without a fade, once it is ready. Stock ffplayout only notices a new
-+/// file at the next clip or when the logo settings are saved.
++/// A helper thread notices a change, decodes the new picture and leaves it for
++/// the next video frame, which shows it as the logo's current frame, the way an
++/// animated logo advances. Nothing is decoded on the video thread and the logo
++/// layer itself stays as it is. Stock ffplayout only picks up a changed file at
++/// the next clip or when the logo settings are saved.
 +struct LiveLogo {
 +    stop: Arc<AtomicBool>,
++    latest: Arc<Mutex<Option<Arc<LogoOverlay>>>>,
 +}
 +
 +impl LiveLogo {
 +    fn start(config: &OutputConfig) -> Option<Self> {
 +        let logo = config.logo.clone().filter(|logo| logo.opacity > 0.0)?;
-+        let control = config.logo_control.clone();
-+        let preparation = config.graphics_preparation.clone();
-+        let canvas = (config.width, config.height);
-+        let channel = config.channel_id;
++        let (width, height) = (config.width, config.height);
 +        let stop = Arc::new(AtomicBool::new(false));
-+        let stopped = stop.clone();
++        let latest = Arc::new(Mutex::new(None));
++        let (stopped, ready) = (stop.clone(), latest.clone());
++        let copy = std::env::temp_dir().join(format!(
++            "ffplayout-live-logo-{}-{}.png",
++            std::process::id(),
++            LIVE_LOGO_IDS.fetch_add(1, Ordering::Relaxed)
++        ));
 +
 +        let spawned = thread::Builder::new()
 +            .name("live-logo".into())
@@ -68,23 +93,54 @@ index a5f91d89..5af572ed 100644
 +                    if current.is_none() || current == seen {
 +                        continue;
 +                    }
-+                    seen = current;
 +
-+                    if let Err(error) =
-+                        control.request(Some(logo.clone()), canvas, channel, preparation.clone())
-+                    {
-+                        debug!("live logo reload failed: {error:#}");
++                    match Self::decode(&logo, &copy, width, height) {
++                        Ok(surface) => {
++                            seen = current;
++                            *ready.lock().unwrap_or_else(PoisonError::into_inner) =
++                                Some(Arc::new(surface));
++                        }
++                        // Caught mid-replacement; the next check tries again.
++                        Err(error) => debug!("live logo not loaded: {error:#}"),
 +                    }
 +                }
++
++                let _ = fs::remove_file(&copy);
 +            });
 +
 +        match spawned {
-+            Ok(_) => Some(Self { stop }),
++            Ok(_) => Some(Self { stop, latest }),
 +            Err(error) => {
 +                debug!("live logo watcher not started: {error}");
 +                None
 +            }
 +        }
++    }
++
++    /// Decodes a private copy: FFmpeg's image reader opens a path more than
++    /// once, and the file may be replaced in between.
++    fn decode(logo: &LogoConfig, copy: &Path, width: u32, height: u32) -> Result<LogoOverlay> {
++        let bytes = fs::read(&logo.path).context("reading logo")?;
++        ensure!(
++            !logo.path.to_lowercase().ends_with(".png")
++                || bytes.len() > 12 && &bytes[bytes.len() - 8..bytes.len() - 4] == b"IEND",
++            "logo file is incomplete"
++        );
++        fs::write(copy, &bytes).context("copying logo")?;
++        let style = LogoStyle {
++            scale: logo.scale.clone(),
++            opacity: logo.opacity,
++            position: logo.position.clone(),
++        };
++        let path = copy.to_string_lossy();
++        let input = open_media_input(&path).context("opening logo")?;
++        let surface = PreparedLogoOverlay::from_input(&style, input, &logo.path, width, height)?;
++
++        Ok(LogoOverlay(Arc::new(surface), None))
++    }
++
++    fn take(&self) -> Option<Arc<LogoOverlay>> {
++        self.latest.try_lock().ok()?.take()
 +    }
 +}
 +
@@ -97,19 +153,64 @@ index a5f91d89..5af572ed 100644
  pub(crate) struct ProgramGraphicsOutput<'a, O: FrameOutput> {
      output: &'a mut O,
      state: &'a mut ProgramGraphicsState,
-@@ -36,6 +114,7 @@ pub(crate) struct ProgramGraphicsOutput<'a, O: FrameOutput> {
+@@ -36,6 +155,7 @@ pub(crate) struct ProgramGraphicsOutput<'a, O: FrameOutput> {
      cache: GraphicsCache,
      manual: ManualGraphics,
      logo_control: LogoControl,
-+    _live_logo: Option<LiveLogo>,
++    live_logo: Option<LiveLogo>,
  }
  
  impl<O: FrameOutput> Drop for ProgramGraphicsOutput<'_, O> {
-@@ -75,6 +154,7 @@ impl<'a, O: FrameOutput> ProgramGraphicsOutput<'a, O> {
+@@ -44,6 +164,8 @@ impl<O: FrameOutput> Drop for ProgramGraphicsOutput<'_, O> {
+         // retain this clip merely through the output's last deferred metadata.
+         let _ = self.output.defer_graphics(GraphicsFrame::default());
+ 
++        // The next clip loads the file as it is then.
++        self.state.live_surface = None;
+         self.state.end_occurrence();
+     }
+ }
+@@ -75,6 +197,7 @@ impl<'a, O: FrameOutput> ProgramGraphicsOutput<'a, O> {
              cache: GraphicsCache::default(),
              manual: config.manual_graphics.clone(),
              logo_control: config.logo_control.clone(),
-+            _live_logo: LiveLogo::start(config),
++            live_logo: LiveLogo::start(config),
          }
      }
  
+@@ -90,6 +213,9 @@ impl<'a, O: FrameOutput> ProgramGraphicsOutput<'a, O> {
+             .unwrap_or_default()
+             .rescale(self.time_base, Rational(1, 1_000_000));
+         self.state.update_live(&self.logo_control, time);
++        if let Some(surface) = self.live_logo.as_ref().and_then(LiveLogo::take) {
++            self.state.live_surface = Some(surface);
++        }
+         let scene = self
+             .clip
+             .as_ref()
+diff --git a/crates/engine/src/graphics/source.rs b/crates/engine/src/graphics/source.rs
+index 7ca6dfe1..4ca50bd4 100644
+--- a/crates/engine/src/graphics/source.rs
++++ b/crates/engine/src/graphics/source.rs
+@@ -227,6 +227,10 @@ pub(crate) struct ProgramGraphicsState {
+     live_revision: u64,
+     live_style: Option<LogoConfig>,
+     styled: Option<(Arc<LogoOverlay>, Arc<LogoOverlay>)>,
++    /// localmusiclive patch: the logo file's latest picture, decoded while the
++    /// clip plays (see `LiveLogo` in program.rs). Shown as the current frame of
++    /// the logo source, like a frame of an animated logo.
++    pub(super) live_surface: Option<Arc<LogoOverlay>>,
+ }
+ 
+ impl ProgramGraphicsState {
+@@ -380,6 +384,10 @@ impl ProgramGraphicsState {
+                     .is_none_or(|style| style.opacity > 0.0),
+         );
+         let selected = self.at(program_us);
++        let selected = match (&self.live_surface, selected) {
++            (Some(live), Some(_)) => Some(live.clone()),
++            (_, selected) => selected,
++        };
+         let selected =
+             if let (Some(source), Some(style)) = (selected.as_ref(), self.live_style.as_ref()) {
+                 if !self
