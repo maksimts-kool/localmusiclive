@@ -1,155 +1,115 @@
-diff --git a/backend/engine/src/playout.rs b/backend/engine/src/playout.rs
-index bb82ebd..77ed1fc 100644
---- a/backend/engine/src/playout.rs
-+++ b/backend/engine/src/playout.rs
-@@ -1,4 +1,10 @@
--use std::{error::Error, fmt, time::Instant};
+diff --git a/crates/engine/src/graphics/program.rs b/crates/engine/src/graphics/program.rs
+index a5f91d89..5af572ed 100644
+--- a/crates/engine/src/graphics/program.rs
++++ b/crates/engine/src/graphics/program.rs
+@@ -1,8 +1,17 @@
+ //! Select immutable graphics on the final program timeline before fan-out.
+-use std::sync::Arc;
 +use std::{
-+    error::Error,
-+    fmt,
-+    sync::mpsc,
++    fs,
++    sync::{
++        Arc,
++        atomic::{AtomicBool, Ordering},
++    },
 +    thread,
-+    time::{Duration, Instant, SystemTime},
++    time::{Duration, SystemTime},
 +};
  
- use anyhow::{Context, Result, anyhow};
- use ffmpeg_next::{
-@@ -16,13 +22,88 @@ use crate::{
-     input::timestamps::LiveTimestampTracker,
-     output::FrameOutput,
-     utils::{
--        config::{OutputConfig, TextOverlayState},
-+        config::{LogoConfig, OutputConfig, TextOverlayState},
-         ffmpeg::{make_video_frame_writable, reference_video_frame},
-         helper::{even, is_live_input, open_media_input},
-     },
+ use anyhow::Result;
+ use ffmpeg_next::{Rational, Rescale, frame};
++use log::debug;
+ 
+ use crate::{
+     clock::SharedPlayoutClock,
+@@ -24,6 +33,75 @@ use super::{
+     source::ProgramGraphicsState,
  };
  
- const LOGO_FADE_SECONDS: f64 = 1.0;
-+/// How often to look at the logo file's modification time; once a frame at
-+/// 30 fps, so a card the panel animates comes through at full frame rate.
++/// How often to look at the logo file; about once a frame at 30 fps, so a
++/// picture another program animates comes through at full frame rate.
 +const LIVE_LOGO_CHECK: Duration = Duration::from_millis(15);
 +
 +/// Reloads the logo when its file changes, so another program can update the
 +/// picture while a clip plays (localmusiclive patch: on-screen song cards).
 +/// Writers should replace the file atomically (write elsewhere, then rename).
 +///
-+/// Decoding and scaling the picture happens on a helper thread: done inside the
-+/// encode loop it would hold up frames and make the stream stutter while the
-+/// card animates. The new picture goes on the first frame after it is ready.
++/// The check runs on its own thread and hands changes to the channel's logo
++/// control, which prepares the new picture off the video thread and swaps it
++/// in, without a fade, once it is ready. Stock ffplayout only notices a new
++/// file at the next clip or when the logo settings are saved.
 +struct LiveLogo {
-+    config: LogoConfig,
-+    width: u32,
-+    height: u32,
-+    modified: Option<SystemTime>,
-+    next_check: Instant,
-+    loading: Option<mpsc::Receiver<(Option<SystemTime>, Result<LogoOverlay>)>>,
++    stop: Arc<AtomicBool>,
 +}
 +
 +impl LiveLogo {
-+    fn new(config: &LogoConfig, width: u32, height: u32, loaded: bool) -> Self {
-+        Self {
-+            config: config.clone(),
-+            width,
-+            height,
-+            modified: loaded.then(|| Self::modified(&config.path)).flatten(),
-+            next_check: Instant::now() + LIVE_LOGO_CHECK,
-+            loading: None,
-+        }
-+    }
++    fn start(config: &OutputConfig) -> Option<Self> {
++        let logo = config.logo.clone().filter(|logo| logo.opacity > 0.0)?;
++        let control = config.logo_control.clone();
++        let preparation = config.graphics_preparation.clone();
++        let canvas = (config.width, config.height);
++        let channel = config.channel_id;
++        let stop = Arc::new(AtomicBool::new(false));
++        let stopped = stop.clone();
 +
-+    fn modified(path: &str) -> Option<SystemTime> {
-+        std::fs::metadata(path).and_then(|meta| meta.modified()).ok()
-+    }
++        let spawned = thread::Builder::new()
++            .name("live-logo".into())
++            .spawn(move || {
++                let revision = |path: &str| {
++                    fs::metadata(path)
++                        .and_then(|meta| Ok((meta.len(), meta.modified()?)))
++                        .ok()
++                };
++                let mut seen: Option<(u64, SystemTime)> = revision(&logo.path);
 +
-+    fn refresh(&mut self, logo: &mut Option<LogoOverlay>) {
-+        if let Some(loading) = &self.loading {
-+            match loading.try_recv() {
-+                Ok((modified, result)) => {
-+                    self.loading = None;
-+                    match result {
-+                        Ok(overlay) => {
-+                            *logo = Some(overlay);
-+                            self.modified = modified;
-+                        }
-+                        Err(error) => trace!("live logo reload failed: {error:#}"),
++                while !stopped.load(Ordering::Relaxed) {
++                    thread::sleep(LIVE_LOGO_CHECK);
++                    let current = revision(&logo.path);
++
++                    if current.is_none() || current == seen {
++                        continue;
++                    }
++                    seen = current;
++
++                    if let Err(error) =
++                        control.request(Some(logo.clone()), canvas, channel, preparation.clone())
++                    {
++                        debug!("live logo reload failed: {error:#}");
 +                    }
 +                }
-+                Err(mpsc::TryRecvError::Empty) => return,
-+                Err(mpsc::TryRecvError::Disconnected) => self.loading = None,
-+            }
-+        }
++            });
 +
-+        let now = Instant::now();
-+        if now < self.next_check {
-+            return;
-+        }
-+        self.next_check = now + LIVE_LOGO_CHECK;
-+
-+        let modified = Self::modified(&self.config.path);
-+        if modified.is_none() || modified == self.modified {
-+            return;
-+        }
-+        let (tx, rx) = mpsc::channel();
-+        let (config, width, height) = (self.config.clone(), self.width, self.height);
-+        let spawned = thread::Builder::new().name("live-logo".into()).spawn(move || {
-+            let _ = tx.send((modified, LogoOverlay::load(&config, width, height)));
-+        });
 +        match spawned {
-+            Ok(_) => self.loading = Some(rx),
-+            Err(error) => trace!("live logo reload thread failed: {error}"),
++            Ok(_) => Some(Self { stop }),
++            Err(error) => {
++                debug!("live logo watcher not started: {error}");
++                None
++            }
 +        }
 +    }
 +}
- const MEDIA_FADE_SECONDS: f64 = 1.0;
- const MEDIA_DURATION_TOLERANCE_US: i64 = 500_000;
- const MIN_LOOP_REMAINING_SECONDS: f64 = 3.0;
-@@ -1230,6 +1311,9 @@ fn encode_composited_frame<O: FrameOutput>(
-     video
-         .runtime_text
-         .update(timeline.video_pts, timeline.text_pts);
-+    if let Some(live_logo) = video.live_logo.as_mut() {
-+        live_logo.refresh(&mut video.logo);
++
++impl Drop for LiveLogo {
++    fn drop(&mut self) {
++        self.stop.store(true, Ordering::Relaxed);
 +    }
-     let video_opacity = media_fade_plan.video_opacity_at(timeline.video_pts);
-     let changes_pixels = video_frame_needs_write(
-         video_opacity,
-@@ -1649,6 +1733,7 @@ struct VideoDecoder {
-     x_offset: u32,
-     y_offset: u32,
-     logo: Option<LogoOverlay>,
-+    live_logo: Option<LiveLogo>,
-     text: Option<TextOverlay>,
-     runtime_text: RuntimeTextOverlay,
-     frame_rate_converter: FrameRateConverter,
-@@ -1700,6 +1785,16 @@ impl VideoDecoder {
-         )?;
-         let runtime_text =
-             RuntimeTextOverlay::new(label, cfg, start_pts, scroll_pts, "runtime text overlay")?;
-+        // A missing or half-written logo must not stop playout; LiveLogo retries.
-+        let logo = cfg.logo.as_ref().and_then(|config| {
-+            LogoOverlay::load(config, cfg.width, cfg.height)
-+                .map_err(|error| debug!("logo not loaded: {error:#}"))
-+                .ok()
-+        });
-+        let live_logo = cfg
-+            .logo
-+            .as_ref()
-+            .map(|config| LiveLogo::new(config, cfg.width, cfg.height, logo.is_some()));
-         Ok(Self {
-             decoder,
-             scaler,
-@@ -1709,11 +1804,8 @@ impl VideoDecoder {
-             scaled_height: scale.scaled_height,
-             x_offset: scale.x_offset,
-             y_offset: scale.y_offset,
--            logo: cfg
--                .logo
--                .as_ref()
--                .map(|logo| LogoOverlay::load(logo, cfg.width, cfg.height))
--                .transpose()?,
-+            logo,
-+            live_logo,
-             text: cfg
-                 .text
-                 .as_ref()
++}
++
+ pub(crate) struct ProgramGraphicsOutput<'a, O: FrameOutput> {
+     output: &'a mut O,
+     state: &'a mut ProgramGraphicsState,
+@@ -36,6 +114,7 @@ pub(crate) struct ProgramGraphicsOutput<'a, O: FrameOutput> {
+     cache: GraphicsCache,
+     manual: ManualGraphics,
+     logo_control: LogoControl,
++    _live_logo: Option<LiveLogo>,
+ }
+ 
+ impl<O: FrameOutput> Drop for ProgramGraphicsOutput<'_, O> {
+@@ -75,6 +154,7 @@ impl<'a, O: FrameOutput> ProgramGraphicsOutput<'a, O> {
+             cache: GraphicsCache::default(),
+             manual: config.manual_graphics.clone(),
+             logo_control: config.logo_control.clone(),
++            _live_logo: LiveLogo::start(config),
+         }
+     }
+ 

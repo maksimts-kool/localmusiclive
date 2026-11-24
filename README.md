@@ -6,7 +6,7 @@
   <img alt="Docker" src="https://img.shields.io/badge/Docker-Compose-ff5f6d?style=for-the-badge&logo=docker&logoColor=white&labelColor=14121f">
   <img alt="Rust" src="https://img.shields.io/badge/Rust-axum-ff8a6a?style=for-the-badge&logo=rust&logoColor=white&labelColor=14121f">
   <img alt="Svelte" src="https://img.shields.io/badge/Svelte-5-ffa86e?style=for-the-badge&logo=svelte&logoColor=white&labelColor=14121f">
-  <img alt="ffplayout" src="https://img.shields.io/badge/ffplayout-2.6-ffc371?style=for-the-badge&logo=ffmpeg&logoColor=white&labelColor=14121f">
+  <img alt="ffplayout" src="https://img.shields.io/badge/ffplayout-2.9-ffc371?style=for-the-badge&logo=ffmpeg&logoColor=white&labelColor=14121f">
 </p>
 
 <p align="center">
@@ -61,9 +61,9 @@ Only the stream is reachable from your network; the panel stays on this computer
 ## Configuration
 
 All settings are in [`.env.example`](.env.example) and take effect after
-`docker compose up -d`. They cover resolution, bitrate, ports, time zone,
-YouTube limits and an optional `RTMP_URL`. Queue, autoplay and on-screen card
-options are in the panel's settings.
+`docker compose up -d`. They cover resolution, bitrate, ports, time zone
+and YouTube limits. Queue, autoplay and on-screen card options are in the
+panel's settings.
 
 ## How it works
 

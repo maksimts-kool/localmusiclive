@@ -208,8 +208,7 @@ pub struct Status {
     pub ffplayout: String,
     pub running: bool,
     pub mode: Option<String>,
-    pub output: Option<String>,
-    /// HLS mode: the watch service's port.
+    /// The watch service's port.
     pub watch_port: Option<i64>,
     pub error: Option<String>,
     pub warnings: Vec<String>,
@@ -221,7 +220,6 @@ impl Default for Status {
             ffplayout: "connecting".into(),
             running: false,
             mode: None,
-            output: None,
             watch_port: None,
             error: None,
             warnings: Vec::new(),
@@ -769,30 +767,39 @@ impl Engine {
         playlist.insert("infinit".into(), json!(false));
         section(&mut cfg, "processing")?.insert("mode".into(), json!("playlist"));
 
-        // ffplayout keeps one output record per mode; selecting a record by id
-        // is what switches the mode.
-        let mode = if s.rtmp_url.is_empty() { "hls" } else { "stream" };
-        let record = self
-            .ff
-            .outputs()
-            .await?
-            .into_iter()
-            .find(|o| o.get("name").and_then(Value::as_str) == Some(mode))
-            .ok_or_else(|| FfError(format!("ffplayout has no {mode} output to configure")))?;
-        let out = section(&mut cfg, "output")?;
-        out.insert("id".into(), record.get("id").cloned().unwrap_or(Value::Null));
-        out.insert("mode".into(), json!(mode));
-        if mode == "stream" {
-            out.insert("stream_type".into(), json!("rtmp"));
-            out.insert("stream_url".into(), json!(s.rtmp_url));
-        } else {
-            // The config still carries the stream record's URL after a switch.
-            let name = record.get("hls_playlist_name").and_then(Value::as_str).filter(|n| !n.is_empty());
-            out.insert("stream_url".into(), json!(""));
-            out.insert("hls_playlist_name".into(), json!(name.unwrap_or("stream")));
-            out.insert("hls_segment_duration".into(), json!(s.hls_segment_seconds.max(1)));
-            out.insert("hls_list_size".into(), json!(s.hls_list_size.max(3)));
-        }
+        // ffplayout keeps several output instances: `output` is the first one,
+        // `outputs` the rest. The channel has one, HLS for the watch service;
+        // any other instance (e.g. an RTMP stream set up in ffplayout's UI) is
+        // switched off.
+        let (mut hls, others) = {
+            let obj = cfg.as_object_mut().ok_or_else(|| FfError("ffplayout sent no configuration".into()))?;
+            let mut all: Vec<Value> = std::iter::once(obj.remove("output").unwrap_or(Value::Null))
+                .chain(match obj.remove("outputs") {
+                    Some(Value::Array(items)) => items,
+                    _ => Vec::new(),
+                })
+                .filter(Value::is_object)
+                .collect();
+            let hls = match all.iter().position(|o| o.get("mode").and_then(Value::as_str) == Some("hls")) {
+                Some(index) => all.remove(index),
+                // id 0: ffplayout adds it as a new instance.
+                None => json!({"id": 0, "mode": "hls"}),
+            };
+            for other in &mut all {
+                other["enabled"] = json!(false);
+            }
+            (hls, all)
+        };
+        let out = hls.as_object_mut().expect("object");
+        out.insert("enabled".into(), json!(true));
+        out.insert("mode".into(), json!("hls"));
+        out.insert("stream_url".into(), json!(""));
+        out.insert("encoding_source_id".into(), Value::Null);
+        out.insert("inherit_resolution".into(), json!(false));
+        let name = out.get("hls_playlist_name").and_then(Value::as_str).filter(|n| !n.is_empty());
+        out.insert("hls_playlist_name".into(), json!(name.unwrap_or("stream")));
+        out.insert("hls_segment_duration".into(), json!(s.hls_segment_seconds.max(1)));
+        out.insert("hls_list_size".into(), json!(s.hls_list_size.max(3)));
         out.insert("width".into(), json!(s.stream_width));
         out.insert("height".into(), json!(s.stream_height));
         out.insert("fps".into(), json!(s.stream_fps as f64));
@@ -807,10 +814,18 @@ impl Engine {
             options.insert("rate_control".into(), json!("cbr"));
             options.insert("maxrate".into(), json!(s.video_bitrate_kbps.to_string()));
             options.remove("quality");
+            out.insert("video_codec".into(), json!("libx264"));
             out.insert("video_options".into(), Value::Object(options));
         }
-        let out_mode = out.get("mode").and_then(Value::as_str).map(str::to_string);
-        let out_url = out.get("stream_url").and_then(Value::as_str).unwrap_or("").to_string();
+        {
+            let obj = cfg.as_object_mut().expect("object");
+            obj.insert("output".into(), hls);
+            obj.insert("outputs".into(), Value::Array(others));
+            obj.insert(
+                "program".into(),
+                json!({"width": s.stream_width, "height": s.stream_height, "fps": s.stream_fps as f64}),
+            );
+        }
 
         // The song card is drawn by the panel and shown through ffplayout's logo
         // slot (see live-logo.patch). ffplayout only accepts a logo file that exists.
@@ -829,8 +844,8 @@ impl Engine {
             section(&mut cfg, "audio")?.insert("loudness_target_lufs".into(), json!(-14.0));
         }
 
-        // Some changes (e.g. switching between HLS and RTMP) make ffplayout stop
-        // the channel; bring back playout that was running.
+        // Some changes make ffplayout stop the channel; bring back playout that
+        // was running.
         let was_active = self.ff.process("status").await?.as_str() == Some("active");
         let mut restart = false;
         if cfg != before {
@@ -861,13 +876,8 @@ impl Engine {
         {
             let mut st = self.st();
             st.status.warnings = warnings;
-            st.status.mode = out_mode.clone();
-            st.status.output = (out_mode.as_deref() == Some("stream") && !out_url.is_empty()).then(|| {
-                let head = out_url.rsplit_once('/').map(|(h, _)| h).unwrap_or(&out_url);
-                let tail: String = out_url.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
-                format!("{head}/••••{tail}")
-            });
-            st.status.watch_port = (out_mode.as_deref() == Some("hls")).then_some(s.watch_port);
+            st.status.mode = Some("hls".into());
+            st.status.watch_port = Some(s.watch_port);
         }
 
         if was_active {
@@ -1998,7 +2008,6 @@ impl Engine {
                 "ffplayout": status.ffplayout,
                 "running": status.running,
                 "mode": status.mode,
-                "output": status.output,
                 "watch_port": status.watch_port,
                 "error": status.error,
                 "warnings": status.warnings,

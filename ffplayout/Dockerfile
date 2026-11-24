@@ -2,22 +2,41 @@
 #
 # The patch makes ffplayout reload its logo image whenever the file changes.
 # The panel uses that to draw the on-screen song card (heading, title, artist,
-# countdown, rounded corners) as a transparent PNG and update it every second.
-# Stock ffplayout reads the logo once per clip and its text overlay is a single
-# plain line style.
+# countdown, rounded corners) as a transparent PNG and update it while it plays.
+# Stock ffplayout only picks up a changed logo file at the next clip, and its
+# text overlay is a single plain line style.
 #
-# Upgrading: bump FFPLAYOUT_VERSION; if the patch no longer applies, port the
-# LiveLogo hunk in backend/engine/src/playout.rs to the new version.
-ARG FFPLAYOUT_VERSION=2.6.0
+# Version: the latest ffplayout release, looked up on every build. Set
+# FFPLAYOUT_VERSION (e.g. 2.9.0) to build a specific one instead. If a new
+# release breaks the patch, the build stops at `git apply`: port the LiveLogo
+# watcher in crates/engine/src/graphics/program.rs to it, or set
+# FFPLAYOUT_VERSION to the last release that worked.
+ARG FFPLAYOUT_VERSION=
+
+# Finds the version to build. The release JSON changes all the time (download
+# counts), but only the version number is passed on, so the clone and build
+# below stay cached until there is a new release.
+FROM debian:trixie-slim AS release
+ARG FFPLAYOUT_VERSION
+ADD https://api.github.com/repos/ffplayout/ffplayout/releases/latest /tmp/latest-release.json
+RUN version="${FFPLAYOUT_VERSION#v}" \
+    && if [ -z "$version" ]; then \
+        version="$(sed -n 's/.*"tag_name": *"v\{0,1\}\([^",]*\)".*/\1/p' /tmp/latest-release.json | head -n 1)"; \
+    fi \
+    && test -n "$version" \
+    && echo "$version" > /version
 
 FROM debian:trixie-slim AS source
-ARG FFPLAYOUT_VERSION
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates git \
     && rm -rf /var/lib/apt/lists/*
-RUN git clone --depth 1 --branch "v${FFPLAYOUT_VERSION}" https://github.com/ffplayout/ffplayout.git /src
+COPY --from=release /version /version
+RUN version="$(cat /version)" \
+    && echo "Building ffplayout $version" \
+    && git clone --depth 1 --branch "v${version}" https://github.com/ffplayout/ffplayout.git /src
 COPY live-logo.patch /tmp/live-logo.patch
-RUN cd /src && git apply /tmp/live-logo.patch
+RUN cd /src && git apply /tmp/live-logo.patch \
+    || { echo "live-logo.patch does not apply to this ffplayout release; see the top of ffplayout/Dockerfile" >&2; exit 1; }
 
 FROM rust:slim-trixie AS build
 RUN apt-get update \
@@ -25,8 +44,6 @@ RUN apt-get update \
         clang \
         libclang-dev \
         libavcodec-dev \
-        libavdevice-dev \
-        libavfilter-dev \
         libavformat-dev \
         libavutil-dev \
         libsqlite3-dev \
@@ -35,6 +52,7 @@ RUN apt-get update \
         pkg-config \
     && rm -rf /var/lib/apt/lists/*
 # ffplayout's build.rs builds its web UI with npm, so Node is needed here too.
+# The runtime links Debian's FFmpeg libraries, which include the SVT-AV1 encoder.
 COPY --from=node:24-bookworm-slim /usr/local/bin/node /usr/local/bin/node
 COPY --from=node:24-bookworm-slim /usr/local/lib/node_modules /usr/local/lib/node_modules
 RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \

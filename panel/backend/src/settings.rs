@@ -15,9 +15,7 @@ pub struct Settings {
     pub ffplayout_mail: String,
     pub channel_id: i64,
 
-    /// Empty: ffplayout writes HLS, which the watch service serves on the LAN.
-    /// Set: ffplayout pushes to this RTMP URL (stream key included) instead.
-    pub rtmp_url: String,
+    /// ffplayout writes HLS, which the watch service serves on the LAN.
     pub watch_port: i64,
     /// Short segments and a short playlist keep viewers close to live. ffplayout
     /// puts a keyframe every 2 s, so segments can't be shorter than that.
@@ -71,7 +69,6 @@ impl Settings {
             ffplayout_password: text("FFPLAYOUT_PASSWORD", ""),
             ffplayout_mail: text("FFPLAYOUT_MAIL", "admin@localhost.invalid"),
             channel_id: int("FFPLAYOUT_CHANNEL", 1),
-            rtmp_url: text("RTMP_URL", "").trim().to_string(),
             watch_port: int("WATCH_PORT", 8090),
             hls_segment_seconds: int("HLS_SEGMENT_SECONDS", 2),
             hls_list_size: int("HLS_LIST_SIZE", 10),

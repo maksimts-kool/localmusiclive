@@ -64,12 +64,11 @@
     if (!status) return { text: 'Connecting…', tone: 'idle' };
     if (status.ffplayout !== 'ok') return { text: `ffplayout ${status.ffplayout}`, tone: 'warn' };
     if (!running) return { text: 'Stopped', tone: 'idle' };
-    return ['stream', 'hls'].includes(status.mode) ? { text: 'On air', tone: 'live' } : { text: status.mode, tone: 'preview' };
+    return status.mode === 'hls' ? { text: 'On air', tone: 'live' } : { text: status.mode, tone: 'preview' };
   });
 
   let output = $derived.by(() => {
     if (!status?.mode) return '';
-    if (status.mode === 'stream') return status.output ? `RTMP · ${status.output}` : 'RTMP stream';
     if (status.mode === 'hls') return status.watch_port ? `On your network · port ${status.watch_port}` : 'HLS';
     return status.mode;
   });

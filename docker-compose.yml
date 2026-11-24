@@ -5,7 +5,8 @@ services:
     build:
       context: ./ffplayout
       args:
-        FFPLAYOUT_VERSION: ${FFPLAYOUT_VERSION:-2.6.0}
+        # Empty: the latest release.
+        FFPLAYOUT_VERSION: ${FFPLAYOUT_VERSION:-}
     restart: unless-stopped
     environment:
       TZ: ${TZ:-Etc/UTC}
@@ -28,7 +29,6 @@ services:
       FFPLAYOUT_USER: ${FFPLAYOUT_USER:-admin}
       FFPLAYOUT_PASSWORD: ${FFPLAYOUT_PASSWORD:?Set FFPLAYOUT_PASSWORD in .env}
       FFPLAYOUT_MAIL: ${FFPLAYOUT_MAIL:-admin@localhost.invalid}
-      RTMP_URL: ${RTMP_URL:-}
       WATCH_PORT: ${WATCH_PORT:-8090}
       HLS_SEGMENT_SECONDS: ${HLS_SEGMENT_SECONDS:-2}
       HLS_LIST_SIZE: ${HLS_LIST_SIZE:-10}

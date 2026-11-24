@@ -231,14 +231,6 @@ impl FFplayout {
             .await
     }
 
-    /// One record per output mode (hls, stream, desktop); config.output.id picks one.
-    pub async fn outputs(&self) -> Result<Vec<Value>> {
-        match self.get(&format!("/api/playout/outputs/{}", self.channel)).await? {
-            Value::Array(items) => Ok(items),
-            _ => Ok(Vec::new()),
-        }
-    }
-
     pub async fn get_channel(&self) -> Result<Value> {
         self.get(&format!("/api/channel/{}", self.channel)).await
     }
