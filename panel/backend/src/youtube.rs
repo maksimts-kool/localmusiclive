@@ -54,6 +54,8 @@ const SEPARATORS: [&str; 6] = [" - ", " – ", " — ", " -- ", " | ", " : "];
 const QUOTES: &[char] = &['"', '\'', '“', '”', '‘', '’', '«', '»'];
 const SEARCH_RESULTS: usize = 15;
 const PARALLEL_DOWNLOADS: usize = 2;
+/// Video that YouTube serves in pieces (HLS/DASH) downloads this many at once.
+const CONCURRENT_FRAGMENTS: &str = "8";
 /// A finished download leaves the list after this long (failed ones stay).
 const AUTO_DISMISS: Duration = Duration::from_secs(5);
 /// New-song suggestions: built from this many most-played songs and artists,
@@ -153,6 +155,22 @@ fn error_message(stderr: &str) -> String {
     let lines = if lines.is_empty() { stderr.trim().lines().collect() } else { lines };
     let message = lines.last().copied().unwrap_or("yt-dlp failed");
     ERROR_PREFIX.replace(message, "").chars().take(300).collect()
+}
+
+/// The format being downloaded and how far it is, from a line of the
+/// --progress-template in fetch(). Pieced (HLS) video has only a rough size
+/// estimate, so it is measured by pieces instead.
+fn progress_line(line: &str) -> Option<(&str, f64)> {
+    let mut parts = line.strip_prefix("[progress]")?.split_whitespace();
+    let format_id = parts.next()?;
+    let mut number = || parts.next().and_then(|p| p.parse::<f64>().ok()).filter(|n| *n > 0.0);
+    let (done, total, estimate, piece, pieces) = (number(), number(), number(), number(), number());
+    let fraction = match (total, pieces) {
+        (Some(total), _) => done.unwrap_or(0.0) / total,
+        (None, Some(pieces)) => piece.unwrap_or(0.0) / pieces,
+        (None, None) => estimate.map_or(0.0, |e| done.unwrap_or(0.0) / e),
+    };
+    Some((format_id, fraction.clamp(0.0, 1.0)))
 }
 
 fn str_field<'a>(value: &'a Value, key: &str) -> &'a str {
@@ -732,11 +750,13 @@ impl YouTube {
                 "-o".into(),
                 format!("{name} [%(id)s].%(ext)s"),
                 "--no-mtime".into(),
+                "--concurrent-fragments".into(),
+                CONCURRENT_FRAGMENTS.into(),
                 "--newline".into(),
                 // --print would otherwise silence it
                 "--progress".into(),
                 "--progress-template".into(),
-                "download:[progress] %(progress.downloaded_bytes)s %(progress.total_bytes)s %(progress.total_bytes_estimate)s".into(),
+                "download:[progress] %(info.format_id)s %(progress.downloaded_bytes)s %(progress.total_bytes)s %(progress.total_bytes_estimate)s %(progress.fragment_index)s %(progress.fragment_count)s".into(),
                 "--print".into(),
                 "after_move:filepath".into(),
             ],
@@ -756,20 +776,15 @@ impl YouTube {
             String::from_utf8_lossy(&buf).into_owned()
         });
 
-        let (mut stage, mut last_fraction, mut last) = (0usize, 0.0f64, None::<PathBuf>);
+        let (mut stage, mut format, mut last) = (0usize, None::<String>, None::<PathBuf>);
         let mut lines = BufReader::new(stdout).lines();
         while let Some(line) = lines.next_line().await? {
             let line = line.trim();
-            if let Some(rest) = line.strip_prefix("[progress]") {
-                let parts: Vec<&str> = rest.split_whitespace().collect();
-                let number = |p: &&str| (!matches!(*p, "NA" | "None")).then(|| p.parse::<f64>().ok()).flatten();
-                let done = parts.first().and_then(number).unwrap_or(0.0);
-                let total = parts.iter().skip(1).find_map(number).unwrap_or(0.0);
-                let fraction = if total > 0.0 { done / total } else { 0.0 };
-                if fraction + 0.2 < last_fraction {
+            if let Some((format_id, fraction)) = progress_line(line) {
+                if format.as_deref().is_some_and(|f| f != format_id) {
                     stage += 1; // next stream (video, then audio)
                 }
-                last_fraction = fraction;
+                format = Some(format_id.to_string());
                 let progress = ((stage.min(streams - 1) as f64 + fraction) / streams as f64).min(0.99);
                 self.update(job_id, |job| job.progress = progress);
                 self.push(false).await;
@@ -873,6 +888,16 @@ mod tests {
     fn formats() {
         assert_eq!(download_formats(0), "bv*+ba/b");
         assert_eq!(download_formats(1080), "bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/b");
+    }
+
+    #[test]
+    fn progress_lines() {
+        assert_eq!(progress_line("[progress] 399 50 200 NA NA NA"), Some(("399", 0.25)));
+        // HLS: the first tiny piece "estimates" the whole file at its own size.
+        assert_eq!(progress_line("[progress] 616 712 NA 712 0 53"), Some(("616", 0.0)));
+        assert_eq!(progress_line("[progress] 616 30662614 NA 147718314.0 10 50"), Some(("616", 0.2)));
+        assert_eq!(progress_line("[progress] 251 50 NA 100 NA NA"), Some(("251", 0.5)));
+        assert_eq!(progress_line("/media/youtube/x [dQw4w9WgXcQ].mp4"), None);
     }
 
     #[test]
