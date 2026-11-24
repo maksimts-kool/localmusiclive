@@ -233,7 +233,8 @@ pub fn render(card: &Card, s: &OverlaySettings, size: (u32, u32)) -> Canvas {
         _ => margin,
     };
     let mut y = if vertical == "top" { margin } else { frame_h - margin - card_h };
-    let rise = round(SLIDE * k * (1.0 - card.opacity as f32));
+    // Ease out: quick at first, settling gently into place.
+    let rise = round(SLIDE * k * (1.0 - card.opacity as f32).clamp(0.0, 1.0).powi(3));
     y += if vertical == "top" { -rise } else { rise };
 
     let radius = round(s.radius as f32 * k);

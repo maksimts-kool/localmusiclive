@@ -1,18 +1,20 @@
 diff --git a/backend/engine/src/playout.rs b/backend/engine/src/playout.rs
-index bb82ebd..51e0e15 100644
+index bb82ebd..77ed1fc 100644
 --- a/backend/engine/src/playout.rs
 +++ b/backend/engine/src/playout.rs
-@@ -1,4 +1,8 @@
+@@ -1,4 +1,10 @@
 -use std::{error::Error, fmt, time::Instant};
 +use std::{
 +    error::Error,
 +    fmt,
++    sync::mpsc,
++    thread,
 +    time::{Duration, Instant, SystemTime},
 +};
  
  use anyhow::{Context, Result, anyhow};
  use ffmpeg_next::{
-@@ -16,13 +20,61 @@ use crate::{
+@@ -16,13 +22,88 @@ use crate::{
      input::timestamps::LiveTimestampTracker,
      output::FrameOutput,
      utils::{
@@ -24,17 +26,24 @@ index bb82ebd..51e0e15 100644
  };
  
  const LOGO_FADE_SECONDS: f64 = 1.0;
-+const LIVE_LOGO_CHECK: Duration = Duration::from_millis(100);
++/// How often to look at the logo file's modification time; once a frame at
++/// 30 fps, so a card the panel animates comes through at full frame rate.
++const LIVE_LOGO_CHECK: Duration = Duration::from_millis(15);
 +
 +/// Reloads the logo when its file changes, so another program can update the
 +/// picture while a clip plays (localmusiclive patch: on-screen song cards).
 +/// Writers should replace the file atomically (write elsewhere, then rename).
++///
++/// Decoding and scaling the picture happens on a helper thread: done inside the
++/// encode loop it would hold up frames and make the stream stutter while the
++/// card animates. The new picture goes on the first frame after it is ready.
 +struct LiveLogo {
 +    config: LogoConfig,
 +    width: u32,
 +    height: u32,
 +    modified: Option<SystemTime>,
 +    next_check: Instant,
++    loading: Option<mpsc::Receiver<(Option<SystemTime>, Result<LogoOverlay>)>>,
 +}
 +
 +impl LiveLogo {
@@ -45,6 +54,7 @@ index bb82ebd..51e0e15 100644
 +            height,
 +            modified: loaded.then(|| Self::modified(&config.path)).flatten(),
 +            next_check: Instant::now() + LIVE_LOGO_CHECK,
++            loading: None,
 +        }
 +    }
 +
@@ -53,6 +63,23 @@ index bb82ebd..51e0e15 100644
 +    }
 +
 +    fn refresh(&mut self, logo: &mut Option<LogoOverlay>) {
++        if let Some(loading) = &self.loading {
++            match loading.try_recv() {
++                Ok((modified, result)) => {
++                    self.loading = None;
++                    match result {
++                        Ok(overlay) => {
++                            *logo = Some(overlay);
++                            self.modified = modified;
++                        }
++                        Err(error) => trace!("live logo reload failed: {error:#}"),
++                    }
++                }
++                Err(mpsc::TryRecvError::Empty) => return,
++                Err(mpsc::TryRecvError::Disconnected) => self.loading = None,
++            }
++        }
++
 +        let now = Instant::now();
 +        if now < self.next_check {
 +            return;
@@ -63,19 +90,21 @@ index bb82ebd..51e0e15 100644
 +        if modified.is_none() || modified == self.modified {
 +            return;
 +        }
-+        match LogoOverlay::load(&self.config, self.width, self.height) {
-+            Ok(overlay) => {
-+                *logo = Some(overlay);
-+                self.modified = modified;
-+            }
-+            Err(error) => trace!("live logo reload failed: {error:#}"),
++        let (tx, rx) = mpsc::channel();
++        let (config, width, height) = (self.config.clone(), self.width, self.height);
++        let spawned = thread::Builder::new().name("live-logo".into()).spawn(move || {
++            let _ = tx.send((modified, LogoOverlay::load(&config, width, height)));
++        });
++        match spawned {
++            Ok(_) => self.loading = Some(rx),
++            Err(error) => trace!("live logo reload thread failed: {error}"),
 +        }
 +    }
 +}
  const MEDIA_FADE_SECONDS: f64 = 1.0;
  const MEDIA_DURATION_TOLERANCE_US: i64 = 500_000;
  const MIN_LOOP_REMAINING_SECONDS: f64 = 3.0;
-@@ -1230,6 +1282,9 @@ fn encode_composited_frame<O: FrameOutput>(
+@@ -1230,6 +1311,9 @@ fn encode_composited_frame<O: FrameOutput>(
      video
          .runtime_text
          .update(timeline.video_pts, timeline.text_pts);
@@ -85,7 +114,7 @@ index bb82ebd..51e0e15 100644
      let video_opacity = media_fade_plan.video_opacity_at(timeline.video_pts);
      let changes_pixels = video_frame_needs_write(
          video_opacity,
-@@ -1649,6 +1704,7 @@ struct VideoDecoder {
+@@ -1649,6 +1733,7 @@ struct VideoDecoder {
      x_offset: u32,
      y_offset: u32,
      logo: Option<LogoOverlay>,
@@ -93,7 +122,7 @@ index bb82ebd..51e0e15 100644
      text: Option<TextOverlay>,
      runtime_text: RuntimeTextOverlay,
      frame_rate_converter: FrameRateConverter,
-@@ -1700,6 +1756,16 @@ impl VideoDecoder {
+@@ -1700,6 +1785,16 @@ impl VideoDecoder {
          )?;
          let runtime_text =
              RuntimeTextOverlay::new(label, cfg, start_pts, scroll_pts, "runtime text overlay")?;
@@ -110,7 +139,7 @@ index bb82ebd..51e0e15 100644
          Ok(Self {
              decoder,
              scaler,
-@@ -1709,11 +1775,8 @@ impl VideoDecoder {
+@@ -1709,11 +1804,8 @@ impl VideoDecoder {
              scaled_height: scale.scaled_height,
              x_offset: scale.x_offset,
              y_offset: scale.y_offset,

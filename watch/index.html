@@ -32,15 +32,37 @@
     background: rgba(14, 17, 24, 0.85);
     font-size: 2.2vh;
     opacity: 0;
-    transition: opacity 0.3s;
+    visibility: hidden;
+    -webkit-transform: translate3d(0, 1vh, 0);
+    transform: translate3d(0, 1vh, 0);
+    -webkit-transition: opacity 0.3s ease-in, -webkit-transform 0.3s ease-in, visibility 0s linear 0.3s;
+    transition: opacity 0.3s ease-in, transform 0.3s ease-in, visibility 0s linear 0.3s;
   }
-  #status.on { opacity: 1; }
+  #status.on {
+    opacity: 1;
+    visibility: visible;
+    -webkit-transform: translate3d(0, 0, 0);
+    transform: translate3d(0, 0, 0);
+    -webkit-transition: opacity 0.3s ease-out, -webkit-transform 0.3s ease-out;
+    transition: opacity 0.3s ease-out, transform 0.3s ease-out;
+  }
+  /* Own compositor layers, so fading these over the video doesn't repaint it
+     every frame (that's what makes fades stutter on TV browsers). */
+  #status, #hint, #play {
+    will-change: opacity, transform;
+    -webkit-backface-visibility: hidden;
+    backface-visibility: hidden;
+  }
   #play {
     position: fixed;
     top: 50%;
     left: 50%;
-    transform: translate(-50%, -50%);
-    display: none;
+    -webkit-transform: translate3d(-50%, -50%, 0) scale(0.94);
+    transform: translate3d(-50%, -50%, 0) scale(0.94);
+    opacity: 0;
+    visibility: hidden;
+    -webkit-transition: opacity 0.25s ease-in, -webkit-transform 0.25s ease-in, visibility 0s linear 0.25s;
+    transition: opacity 0.25s ease-in, transform 0.25s ease-in, visibility 0s linear 0.25s;
     padding: 0.7em 1.6em;
     border: 0.12em solid rgba(255, 255, 255, 0.4);
     border-radius: 0.6em;
@@ -51,7 +73,14 @@
     font-weight: 600;
   }
   #play:focus { outline: 0.12em solid #fff; outline-offset: 0.2em; }
-  #play.on { display: block; }
+  #play.on {
+    opacity: 1;
+    visibility: visible;
+    -webkit-transform: translate3d(-50%, -50%, 0) scale(1);
+    transform: translate3d(-50%, -50%, 0) scale(1);
+    -webkit-transition: opacity 0.3s ease-out, -webkit-transform 0.3s ease-out;
+    transition: opacity 0.3s ease-out, transform 0.3s ease-out;
+  }
   #hint {
     position: fixed;
     right: 3vw;
@@ -61,9 +90,20 @@
     background: rgba(14, 17, 24, 0.85);
     font-size: 2.2vh;
     opacity: 0;
-    transition: opacity 0.5s;
+    visibility: hidden;
+    -webkit-transform: translate3d(0, -1vh, 0);
+    transform: translate3d(0, -1vh, 0);
+    -webkit-transition: opacity 0.5s ease-in, -webkit-transform 0.5s ease-in, visibility 0s linear 0.5s;
+    transition: opacity 0.5s ease-in, transform 0.5s ease-in, visibility 0s linear 0.5s;
   }
-  #hint.on { opacity: 1; }
+  #hint.on {
+    opacity: 1;
+    visibility: visible;
+    -webkit-transform: translate3d(0, 0, 0);
+    transform: translate3d(0, 0, 0);
+    -webkit-transition: opacity 0.4s ease-out, -webkit-transform 0.4s ease-out;
+    transition: opacity 0.4s ease-out, transform 0.4s ease-out;
+  }
   #hint b { color: #ff5c7a; }
 </style>
 </head>
@@ -87,9 +127,12 @@
     var lastTime = -1;
     var stalledFor = 0;
 
+    // Keeps the old text while the box fades out, so it doesn't shrink to an
+    // empty box mid-fade; only touches the DOM when something changes.
     function status(text) {
-      statusBox.textContent = text || '';
-      statusBox.className = text ? 'on' : '';
+      if (text && statusBox.textContent !== text) statusBox.textContent = text;
+      var cls = text ? 'on' : '';
+      if (statusBox.className !== cls) statusBox.className = cls;
     }
 
     function play() {
@@ -233,7 +276,9 @@
     // Hide the mouse pointer (or the TV's remote pointer) when it isn't moving.
     var idleTimer = null;
     document.addEventListener('mousemove', function () {
-      document.body.className = '';
+      // mousemove fires many times a second; restyling the page each time
+      // makes running fades stutter.
+      if (document.body.className) document.body.className = '';
       if (!isFullscreen() && hintBox.className !== 'on') hint();
       clearTimeout(idleTimer);
       idleTimer = setTimeout(function () { document.body.className = 'idle'; }, 3000);

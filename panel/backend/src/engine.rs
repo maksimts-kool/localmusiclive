@@ -1554,11 +1554,15 @@ impl Engine {
     }
 
     async fn overlay_loop(self: Arc<Self>) {
-        // Fades need ~10 updates a second; otherwise the card changes once a
-        // second (countdown), the progress line every LINE_STEP, and the frame
-        // is only redrawn when something visible changes.
+        // Ticks once per stream frame so fades and slides are smooth; the frame
+        // is only redrawn when something visible changes, so outside of fades
+        // the card changes once a second (countdown) and the progress line
+        // every LINE_STEP.
+        let fps = self.s.stream_fps.clamp(10, 60) as f64;
+        let mut tick = tokio::time::interval(Duration::from_secs_f64(1.0 / fps));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tick.tick().await;
             if let Err(err) = self.update_overlay().await {
                 tracing::error!("Overlay update failed: {err:#}");
             }
